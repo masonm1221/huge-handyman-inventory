@@ -1,0 +1,3 @@
+ts,user,category,item,action,qty
+2025-11-10 22:39:32.834098+00:00,admin,Power Tools,M18 Roto Hammer,check_out,1
+2025-11-10T22:39:46.799888+00:00,admin,Power Tools,M18 Roto Hammer,check_in,1
