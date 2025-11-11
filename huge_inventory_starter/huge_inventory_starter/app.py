@@ -275,19 +275,6 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
 # -----------------------------------------------------------------------------
 # ------------------------- Categories (single orange bar) ---------------------
 
-# 1) Make sure the category list exists
-CATEGORY_LABELS = [
-    "Power Tools",
-    "Hand Tools",
-    "Ladders",
-    "Extension Cords",
-    "Masking & Protection",
-    "Batteries",
-    "Blankets & Drop Cloths",
-    "Extra Material",
-    "Bags / Accessories",
-]
-
 # 2) Keep the current user visible (optional, keep or remove)
 # ------------------------------------------------------------------
 # Logged in as (show once)
