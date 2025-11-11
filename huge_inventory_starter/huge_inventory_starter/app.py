@@ -292,6 +292,26 @@ CATEGORY_LABELS = [
 
 # 2) Keep the current user visible (optional, keep or remove)
 st.write(f"**Logged in as:** {st.session_state.get('current_user', 'Guest')}")
+# --- FIX: make sure category state is always defined (no UI changes) ---
+
+# If your file already defines CATEGORY_LABELS, this `try/except` does nothing.
+# If not, this safe fallback prevents a NameError.
+try:
+    CATEGORY_LABELS
+except NameError:
+    CATEGORY_LABELS = [
+        "Power Tools", "Hand Tools", "Ladders", "Extension Cords",
+        "Masking & Protection", "Batteries", "Blankets & Drop Cloths",
+        "Extra Material", "Bags / Accessories",
+    ]
+
+# Ensure the session has an active category, and expose the two names
+# that the rest of your app may reference.
+if "active_cat" not in st.session_state:
+    st.session_state["active_cat"] = CATEGORY_LABELS[0]
+
+active_cat = st.session_state["active_cat"]   # used by legacy code like: if active_cat in ...
+active_label = active_cat                     # if your code checks active_label anywhere
 
 # 3) Active category state
 if "active_cat" not in st.session_state:
