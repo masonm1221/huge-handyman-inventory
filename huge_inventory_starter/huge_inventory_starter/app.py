@@ -272,8 +272,6 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
             st.warning(f"Deleted {rm_emp}")
             st.rerun()
 
-st.write(f"**Logged in as:** {st.session_state['current_user']}")
-
 # -----------------------------------------------------------------------------
 # ------------------------- Categories (single orange bar) ---------------------
 
@@ -291,27 +289,38 @@ CATEGORY_LABELS = [
 ]
 
 # 2) Keep the current user visible (optional, keep or remove)
-st.write(f"**Logged in as:** {st.session_state.get('current_user', 'Guest')}")
-# --- FIX: make sure category state is always defined (no UI changes) ---
+# ------------------------------------------------------------------
+# Logged in as (show once)
+# ------------------------------------------------------------------
+st.write(f"Logged in as: {st.session_state.get('current_user', 'Guest')}")
 
-# If your file already defines CATEGORY_LABELS, this `try/except` does nothing.
-# If not, this safe fallback prevents a NameError.
+# ------------------------------------------------------------------
+# Category definitions (guarded so app won't crash if not defined)
+# ------------------------------------------------------------------
 try:
-    CATEGORY_LABELS
+    CATEGORY_LABELS  # already present somewhere else
 except NameError:
     CATEGORY_LABELS = [
-        "Power Tools", "Hand Tools", "Ladders", "Extension Cords",
-        "Masking & Protection", "Batteries", "Blankets & Drop Cloths",
-        "Extra Material", "Bags / Accessories",
+        "Power Tools",
+        "Hand Tools",
+        "Ladders",
+        "Extension Cords",
+        "Masking & Protection",
+        "Batteries",
+        "Blankets & Drop Cloths",
+        "Extra Material",
+        "Bags / Accessories",
     ]
 
-# Ensure the session has an active category, and expose the two names
-# that the rest of your app may reference.
+# ------------------------------------------------------------------
+# Session state for selected category
+# ------------------------------------------------------------------
 if "active_cat" not in st.session_state:
     st.session_state["active_cat"] = CATEGORY_LABELS[0]
 
-active_cat = st.session_state["active_cat"]   # used by legacy code like: if active_cat in ...
-active_label = active_cat                     # if your code checks active_label anywhere
+active_cat = st.session_state["active_cat"]
+active_label = active_cat
+                     # if your code checks active_label anywhere
 
 # 3) Active category state
 if "active_cat" not in st.session_state:
