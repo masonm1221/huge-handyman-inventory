@@ -275,30 +275,33 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
 st.write(f"**Logged in as:** {st.session_state['current_user']}")
 
 # -----------------------------------------------------------------------------
-# Category bar
+# Category Bar (single)
 # -----------------------------------------------------------------------------
-active_cat = st.session_state.get("active_cat", CATEGORIES[0])
+if "active_cat" not in st.session_state:
+    st.session_state["active_cat"] = CATEGORY_LABELS[0]
 
-st.markdown('<div class="hh-catbar">', unsafe_allow_html=True)
-cat_cols = st.columns(len(CATEGORIES))
-for i, label in enumerate(CATEGORIES):
-    is_active = (label == active_cat)
-    btn = cat_cols[i].button(label)
-    # A button for look, but we also display static pill so user sees current
-    cat_cols[i].markdown(
-        f"<div class='hh-cat {'active' if is_active else ''}'>{label}</div>",
-        unsafe_allow_html=True
-    )
-    if btn:
-        active_cat = label
-        st.session_state["active_cat"] = label
-st.markdown('</div>', unsafe_allow_html=True)
+# One clean radio picker (no duplicates)
+active_cat = st.radio(
+    "Select Category",
+    CATEGORY_LABELS,
+    horizontal=True,
+    index=(
+        CATEGORY_LABELS.index(st.session_state["active_cat"])
+        if st.session_state["active_cat"] in CATEGORY_LABELS
+        else 0
+    ),
+    key="category_picker",  # ensures a stable widget key
+)
+
+# Keep session state in sync
+st.session_state["active_cat"] = active_cat
+
 st.divider()
 
 # -----------------------------------------------------------------------------
 # Content
 # -----------------------------------------------------------------------------
-st.subheader(active_cat)
+st.subheader(st.session_state["active_cat"])
 
 # Text-entry categories
 if active_cat in TEXT_LOGS:
