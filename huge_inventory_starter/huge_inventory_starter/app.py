@@ -1,414 +1,395 @@
-# app.py — HUGE Handyman Inventory (Google Sheets backend)
-# Data lives in your Google Spreadsheet (durable).
-# - Tools by category with availability
-# - Holder name(s) shown next to "Unavailable"
-# - Only holder (or admin) can Check In
-# - Text-entry categories ("Extra Material", "Bags / Accessories")
-# - Admin: add/update tools, manage employees
-# Secrets expected in Streamlit Cloud:
-#   GOOGLE_CREDENTIALS = """{...full service-account JSON...}"""
-#   SHEETS_ID = "your_sheet_id"
-#   TOOLS_SHEET = "tools"
-#   ROSTER_SHEET = "roster"
-#   TX_SHEET     = "transactions"
-#   EXTRA_SHEET  = "extra_material"
-#   BAGS_SHEET   = "bags_accessories"
-#   ADMIN_PASSWORD = "YourStrongPassword"   (optional; defaults to 'admin')
+# Author: HUGE Handyman + ChatGPT
+# Streamlit + PostgreSQL (SQLAlchemy)
+# Inventory: simple categories; show holder; restricted check-in; blue/orange theme
 
-import json
-import uuid
+import os
 from datetime import datetime
-import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+import streamlit as st
+from sqlalchemy import create_engine, text
 
-# --------------------- UI / THEME ---------------------
+# -----------------------------------------------------------------------------
+# Config & Styling
+# -----------------------------------------------------------------------------
 APP_BRAND = "HUGE Handyman"
-HUGE_BLUE = "#0a4d8c"
-OK_GREEN = "#16a34a"
-BAD_RED = "#dc2626"
+HUGE_BLUE = "#004B8D"
+HUGE_ORANGE = "#E75B2A"
+HUGE_DARK = "#333333"
 
-st.set_page_config(page_title=f"{APP_BRAND} — Inventory", layout="wide")
+st.set_page_config(page_title=f"{APP_BRAND} Inventory", layout="wide")
+
 st.markdown(
     f"""
     <style>
-      .chip {{display:inline-block;padding:4px 10px;border-radius:999px;color:#fff;font-weight:700;font-size:12px}}
-      .ok {{background:{OK_GREEN}}}
-      .bad {{background:{BAD_RED}}}
-      .muted {{color:#777}}
-      .tool-card {{border:1px solid #eee;border-radius:12px;padding:12px;margin-bottom:10px;background:#fff}}
+      .hh-header {{
+        width: 100%; padding: 12px 18px; background: white; border-bottom: 2px solid #eee;
+        display: flex; align-items: center; justify-content: space-between; position: sticky;
+        top: 0; z-index: 100; box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+      }}
+      .hh-left {{display:flex;align-items:center;gap:16px;}}
+      .hh-title {{font-weight: 800; font-size: 22px; color: {HUGE_DARK}; letter-spacing: .5px;}}
+
+      .hh-catbar {{ display:flex; flex-wrap: wrap; gap:10px; margin: 10px 0 6px 0; z-index:1; position:relative; }}
+      .hh-cat {{
+        background: white; color:{HUGE_BLUE}; padding:10px 16px; border-radius:10px; font-weight:700;
+        border:2px solid {HUGE_BLUE}; cursor:pointer; user-select:none; font-size:15px;
+      }}
+      .hh-cat.active {{ background:{HUGE_BLUE}; color:white; }}
+
+      .chip {{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:700; font-size:12px; color:white; }}
+      .chip.ok {{ background:#16a34a; }}
+      .chip.bad {{ background:#dc2626; }}
+      .chip.warn {{ background:#f59e0b; color:#111; }}
+
+      .hh-card {{ background:#fff; border:1px solid #eee; border-radius:12px; padding:12px; margin-bottom:8px; }}
+
+      .stButton>button {{ border-radius:10px; border:2px solid {HUGE_BLUE}; color:{HUGE_BLUE}; }}
+      .stButton>button:hover {{ filter: brightness(1.05); }}
+      div.stButton>button[kind="secondary"] {{ border:2px solid {HUGE_ORANGE}; color:{HUGE_ORANGE}; }}
+      div.stButton>button[kind="primary"] {{ background:{HUGE_BLUE}; color:white; border:2px solid {HUGE_BLUE}; }}
+
+      /* radio row spacing */
+      .stRadio > div{{ flex-direction:row; gap:18px; }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# --------------------- SECRETS -------------------------
-SECRETS = st.secrets
-ADMIN_PASSWORD = SECRETS.get("ADMIN_PASSWORD", "admin")
+# -----------------------------------------------------------------------------
+# Database (Render Postgres or local SQLite fallback)
+# -----------------------------------------------------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///local.db")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-SHEETS_ID = SECRETS.get("SHEETS_ID", "")
-TOOLS_SHEET = SECRETS.get("TOOLS_SHEET", "tools")
-ROSTER_SHEET = SECRETS.get("ROSTER_SHEET", "roster")
-TX_SHEET     = SECRETS.get("TX_SHEET", "transactions")
-EXTRA_SHEET  = SECRETS.get("EXTRA_SHEET", "extra_material")
-BAGS_SHEET   = SECRETS.get("BAGS_SHEET", "bags_accessories")
+def init_db():
+    schema_sql = """
+    create table if not exists tools (
+        id serial primary key,
+        name text unique,
+        category text,
+        quantity int default 0,
+        current_out int default 0
+    );
 
-# ----------------- GOOGLE AUTH / CLIENT ----------------
-def get_gc():
-    creds_dict = json.loads(SECRETS["GOOGLE_CREDENTIALS"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(credentials)
+    create table if not exists users (
+        id serial primary key,
+        name text unique,
+        pin text
+    );
 
-gc = get_gc()
-sh = gc.open_by_key(SHEETS_ID)
+    create table if not exists transactions (
+        id serial primary key,
+        tool_id int,
+        user_name text,
+        action text check (action in ('check_out','check_in')),
+        ts timestamptz default now()
+    );
 
-ws_tools = sh.worksheet(TOOLS_SHEET)
-ws_roster = sh.worksheet(ROSTER_SHEET)
-ws_tx = sh.worksheet(TX_SHEET)
-ws_extra = sh.worksheet(EXTRA_SHEET)
-ws_bags = sh.worksheet(BAGS_SHEET)
+    create table if not exists extra_material_log (
+        id serial primary key,
+        user_name text,
+        entry text,
+        ts timestamptz default now()
+    );
 
-# ----------------- HELPERS (SHEETS <-> DF) --------------
-def ws_to_df(ws):
-    data = ws.get_all_records()
-    return pd.DataFrame(data)
+    create table if not exists bags_accessories_log (
+        id serial primary key,
+        user_name text,
+        entry text,
+        ts timestamptz default now()
+    );
+    """
+    with engine.begin() as conn:
+        for stmt in schema_sql.strip().split(";\n\n"):
+            conn.execute(text(stmt + ";"))
 
-def df_to_ws(df, ws):
-    headers = list(df.columns)
-    values = [headers] + df.astype(str).values.tolist()
-    ws.clear()
-    ws.update(values)
+init_db()
 
-def append_row(ws, row_dict):
-    headers = ws.row_values(1)
-    ordered = [row_dict.get(h, "") for h in headers]
-    ws.append_row(ordered, value_input_option="RAW")
+def db_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn, params=params)
 
-def ensure_headers(ws, expected):
-    hdr = ws.row_values(1)
-    if hdr != expected:
-        ws.clear()
-        ws.update([expected])
+def db_exec(sql: str, params: dict | None = None):
+    with engine.begin() as conn:
+        conn.execute(text(sql), params or {})
 
-# ----------------- ENSURE HEADERS EXIST ------------------
-ensure_headers(ws_tools, ["name","category","quantity","current_out"])
-ensure_headers(ws_roster, ["name","pin"])
-ensure_headers(ws_tx, ["ts","user","action","item","qty","notes"])
-ensure_headers(ws_extra, ["ts","user","entry"])
-ensure_headers(ws_bags, ["ts","user","entry"])
+# -----------------------------------------------------------------------------
+# Data helpers
+# -----------------------------------------------------------------------------
+CATEGORIES = [
+    "Power Tools",
+    "Hand Tools",
+    "Ladders",
+    "Extension Cords",
+    "Masking & Protection",
+    "Batteries",
+    "Blankets & Drop Cloths",
+    "Extra Material",
+    "Bags / Accessories",
+]
 
-# ----------------- DOMAIN: TOOLS -------------------------
-def load_tools() -> pd.DataFrame:
-    df = ws_to_df(ws_tools)
-    if df.empty:
-        return pd.DataFrame(columns=["name","category","quantity","current_out"])
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
-    df["current_out"] = pd.to_numeric(df["current_out"], errors="coerce").fillna(0).astype(int)
+TEXT_LOGS = {
+    "Extra Material": "extra_material_log",
+    "Bags / Accessories": "bags_accessories_log",
+}
+
+def upsert_tool(name: str, category: str, quantity: int):
+    db_exec(
+        """
+        insert into tools(name, category, quantity)
+        values (:n, :c, :q)
+        on conflict(name)
+        do update set category = excluded.category,
+                      quantity = excluded.quantity
+        """,
+        {"n": name.strip(), "c": category, "q": int(quantity)},
+    )
+
+def list_tools_by_category(cat: str) -> pd.DataFrame:
+    df = db_read_df("select * from tools where category = :c order by name", {"c": cat})
+    if not df.empty:
+        df["available_qty"] = (df["quantity"].fillna(0).astype(int) - df["current_out"].fillna(0).astype(int)).clip(lower=0)
     return df
 
-def upsert_tool(name: str, category: str, qty: int):
-    df = load_tools()
-    mask = (df["name"].str.lower() == name.strip().lower()) & (df["category"] == category)
-    if mask.any():
-        df.loc[mask, "quantity"] = int(qty)
-    else:
-        df.loc[len(df)] = [name.strip(), category, int(qty), 0]
-    df_to_ws(df, ws_tools)
-
-def delete_tool(name: str, category: str):
-    df = load_tools()
-    df = df[~((df["name"].str.lower()==name.strip().lower()) & (df["category"]==category))]
-    df_to_ws(df, ws_tools)
-
-# ----------------- DOMAIN: ROSTER ------------------------
-def load_roster() -> pd.DataFrame:
-    df = ws_to_df(ws_roster)
+def record_checkout(tool_id: int, user_name: str) -> bool:
+    # only allow if available > 0
+    df = db_read_df("select quantity, current_out from tools where id = :tid", {"tid": tool_id})
     if df.empty:
-        df = pd.DataFrame([{"name":"Guest","pin":""}])
-        df_to_ws(df, ws_roster)
-    return df
+        return False
+    available = int(df.iloc[0]["quantity"]) - int(df.iloc[0]["current_out"])
+    if available <= 0:
+        return False
+    db_exec("update tools set current_out = current_out + 1 where id = :tid", {"tid": tool_id})
+    db_exec(
+        "insert into transactions(tool_id, user_name, action) values (:tid, :u, 'check_out')",
+        {"tid": tool_id, "u": user_name},
+    )
+    return True
 
-def save_roster(df: pd.DataFrame):
-    df = df[["name","pin"]]
-    df_to_ws(df, ws_roster)
+def record_checkin(tool_id: int, user_name: str) -> bool:
+    # Only current holder or admin can check in (admin check in UI)
+    db_exec("update tools set current_out = greatest(current_out - 1, 0) where id = :tid", {"tid": tool_id})
+    db_exec(
+        "insert into transactions(tool_id, user_name, action) values (:tid, :u, 'check_in')",
+        {"tid": tool_id, "u": user_name},
+    )
+    return True
 
-# ----------------- DOMAIN: TRANSACTIONS ------------------
-def append_tx(ts: str, user: str, action: str, item: str, qty: int, notes: str=""):
-    append_row(ws_tx, {
-        "ts": ts, "user": user, "action": action, "item": item, "qty": str(qty), "notes": notes
-    })
+def last_holder(tool_id: int) -> str | None:
+    # last action determines holder; if last is check_out => that user holds it
+    df = db_read_df(
+        """
+        select user_name, action
+        from transactions
+        where tool_id = :tid
+        order by ts desc
+        limit 1
+        """,
+        {"tid": tool_id},
+    )
+    if not df.empty and df.iloc[0]["action"] == "check_out":
+        return df.iloc[0]["user_name"]
+    return None
 
-def load_tx() -> pd.DataFrame:
-    df = ws_to_df(ws_tx)
-    if df.empty:
-        return pd.DataFrame(columns=["ts","user","action","item","qty","notes"])
-    return df
+def log_text(which: str, user_name: str, entry: str):
+    table = "extra_material_log" if which == "extra" else "bags_accessories_log"
+    db_exec(
+        f"insert into {table}(user_name, entry) values (:u, :e)",
+        {"u": user_name, "e": entry.strip()},
+    )
 
-def tool_key(name: str, category: str) -> str:
-    # Use a stable key so same name in different categories is unique
-    return f"{name} [{category}]"
+def read_log(table: str, limit: int = 50) -> pd.DataFrame:
+    return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
 
-def current_holders(key: str) -> list[str]:
-    df = load_tx()
-    if df.empty:
-        return []
-    sub = df[df["item"].astype(str) == key]
-    if sub.empty:
-        return []
-    pvt = sub.pivot_table(index="user", columns="action", aggfunc="size", fill_value=0)
-    outs = pvt["check_out"] if "check_out" in pvt.columns else 0
-    ins  = pvt["check_in"]  if "check_in"  in pvt.columns else 0
-    net = outs - ins
-    holders = []
-    if hasattr(net, "items"):
-        for u, n in net.items():
-            if n > 0:
-                holders.extend([str(u)] * int(n))
-    return holders
+# Roster
+def list_users() -> list[str]:
+    df = db_read_df("select name from users order by name")
+    return df["name"].tolist() if not df.empty else []
 
-def available_count(quantity: int, holders: list[str]) -> int:
-    return max(int(quantity) - len(holders), 0)
+def add_user(name: str, pin: str | None = None):
+    db_exec(
+        "insert into users(name, pin) values (:n, :p) on conflict(name) do nothing",
+        {"n": name.strip(), "p": (pin or "").strip()},
+    )
 
-def sync_current_out_in_tools():
-    df = load_tools()
-    changed = False
-    for idx, row in df.iterrows():
-        key = tool_key(row["name"], row["category"])
-        holders = current_holders(key)
-        new_out = len(holders)
-        if int(row.get("current_out", 0)) != new_out:
-            df.at[idx, "current_out"] = new_out
-            changed = True
-    if changed:
-        df_to_ws(df, ws_tools)
+def delete_user(name: str):
+    db_exec("delete from users where name = :n", {"n": name})
 
-# ----------------- DOMAIN: TEXT LOGS ---------------------
-def append_text_log(which: str, user: str, entry: str):
-    ws = ws_extra if which == "Extra Material" else ws_bags
-    append_row(ws, {"ts": datetime.now().isoformat(timespec="seconds"), "user": user, "entry": entry.strip()})
-
-def load_text_log(which: str) -> pd.DataFrame:
-    ws = ws_extra if which == "Extra Material" else ws_bags
-    return ws_to_df(ws)
-
-# ----------------- SESSION ------------------------------
+# -----------------------------------------------------------------------------
+# Session & Auth
+# -----------------------------------------------------------------------------
 if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
 if "current_user" not in st.session_state:
-    st.session_state["current_user"] = ""
+    st.session_state["current_user"] = "Guest"
 
-# ----------------- SIDEBAR ------------------------------
-with st.sidebar:
-    st.header(APP_BRAND)
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
-    roster_df = load_roster()
-    names = ["—"] + sorted(roster_df["name"].astype(str).tolist())
-    sel = st.selectbox("Select your name", names, index=0)
-    typed = st.text_input("Or type your name")
-    chosen = typed.strip() or ("" if sel=="—" else sel)
-    st.session_state["current_user"] = chosen
-    st.caption(f"Logged in as: **{st.session_state['current_user'] or 'Guest'}**")
+# -----------------------------------------------------------------------------
+# Header & Sidebar
+# -----------------------------------------------------------------------------
+st.markdown('<div class="hh-header">', unsafe_allow_html=True)
+st.markdown(f'<div class="hh-left"><div class="hh-title">{APP_BRAND} — Inventory</div></div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("Admin Login")
-    pw = st.text_input("Password", type="password")
-    c1, c2 = st.columns(2)
-    if c1.button("Login"):
-        if pw == ADMIN_PASSWORD:
-            st.session_state["is_admin"] = True
-            st.success("Admin mode enabled")
-            st.experimental_rerun()
-        else:
-            st.error("Wrong password")
-    if c2.button("Logout"):
+# Sidebar: choose user
+st.sidebar.header(APP_BRAND)
+roster = list_users()
+picked = st.sidebar.selectbox("Select your name", ["—"] + roster, index=0)
+typed_name = st.sidebar.text_input("Or type your name")
+
+if st.sidebar.button("Use Roster"):
+    if picked and picked != "—":
+        st.session_state["current_user"] = picked
+    elif typed_name.strip():
+        st.session_state["current_user"] = typed_name.strip()
+
+# Admin login
+st.sidebar.subheader("Admin Login")
+admin_pw = st.sidebar.text_input("Password", type="password")
+if st.sidebar.button("Login"):
+    st.session_state["is_admin"] = (admin_pw == ADMIN_PASSWORD)
+if st.session_state["is_admin"]:
+    st.sidebar.success("Admin mode enabled")
+    if st.sidebar.button("Logout"):
         st.session_state["is_admin"] = False
-        st.experimental_rerun()
 
-# ----------------- CATEGORIES ---------------------------
-TOOL_CATEGORIES = [
-    "Power Tools","Hand Tools","Ladders","Extension Cords",
-    "Masking & Protection","Batteries","Blankets & Drop Cloths"
-]
-TEXT_CATEGORIES = ["Extra Material","Bags / Accessories"]
-ALL_CATEGORIES = TOOL_CATEGORIES + TEXT_CATEGORIES
+# Roster management (admin)
+with st.sidebar.expander("Admin — Manage Employees", expanded=False):
+    st.caption("Add / remove names for the employee dropdown.")
+    new_emp = st.text_input("Add employee name", key="add_emp_name")
+    new_pin = st.text_input("Optional PIN", key="add_emp_pin")
+    cols = st.columns([1,1,1])
+    if cols[0].button("Add to roster"):
+        if new_emp.strip():
+            add_user(new_emp.strip(), new_pin.strip())
+            st.success(f"Added {new_emp}")
+            st.rerun()
+    if roster:
+        rm_emp = st.selectbox("Delete employee", ["—"] + roster, key="rm_emp")
+        if cols[1].button("Delete selected") and rm_emp != "—":
+            delete_user(rm_emp)
+            st.warning(f"Deleted {rm_emp}")
+            st.rerun()
 
-st.markdown("### Tool Inventory")
-cat = st.radio("Select Category:", ALL_CATEGORIES, horizontal=True)
+st.write(f"**Logged in as:** {st.session_state['current_user']}")
 
-# Keep the current_out column synced with transactions
-sync_current_out_in_tools()
+# -----------------------------------------------------------------------------
+# Category bar
+# -----------------------------------------------------------------------------
+active_cat = st.session_state.get("active_cat", CATEGORIES[0])
 
-# ----------------- TEXT CATEGORIES VIEW -----------------
-if cat in TEXT_CATEGORIES:
-    st.subheader(cat)
-    with st.form(f"form_{cat.replace(' ','_')}"):
-        entry = st.text_input("Describe what you’re taking", placeholder="e.g., 1 Milwaukee bag with 2 fine tool blades")
+st.markdown('<div class="hh-catbar">', unsafe_allow_html=True)
+cat_cols = st.columns(len(CATEGORIES))
+for i, label in enumerate(CATEGORIES):
+    is_active = (label == active_cat)
+    btn = cat_cols[i].button(label)
+    # A button for look, but we also display static pill so user sees current
+    cat_cols[i].markdown(
+        f"<div class='hh-cat {'active' if is_active else ''}'>{label}</div>",
+        unsafe_allow_html=True
+    )
+    if btn:
+        active_cat = label
+        st.session_state["active_cat"] = label
+st.markdown('</div>', unsafe_allow_html=True)
+st.divider()
+
+# -----------------------------------------------------------------------------
+# Content
+# -----------------------------------------------------------------------------
+st.subheader(active_cat)
+
+# Text-entry categories
+if active_cat in TEXT_LOGS:
+    table = TEXT_LOGS[active_cat]
+    with st.form(f"log_form_{table}"):
+        entry = st.text_input("Describe what you’re taking:", placeholder="e.g., 1 Milwaukee bag with 2 fine tool blades")
         submitted = st.form_submit_button("Submit")
-        if submitted:
-            user = st.session_state.get("current_user","").strip()
-            if not user:
-                st.warning("Pick your name first (sidebar).")
-            elif not entry.strip():
-                st.warning("Please type something.")
-            else:
-                append_text_log(cat, user, entry)
-                st.success("Logged.")
-                st.experimental_rerun()
+        if submitted and entry.strip():
+            log_text("extra" if table == "extra_material_log" else "bags", st.session_state["current_user"], entry)
+            st.success("Logged successfully!")
+            st.rerun()
 
-    logs = load_text_log(cat)
+    logs = read_log(table, limit=50)
     if logs.empty:
         st.info("No entries yet.")
     else:
-        st.dataframe(logs.sort_values("ts", ascending=False), use_container_width=True)
+        st.dataframe(logs, use_container_width=True)
 
-# ----------------- TOOL CATEGORIES VIEW -----------------
+# Tool categories
 else:
-    st.subheader(cat)
-    is_admin = bool(st.session_state["is_admin"])
-    tools = load_tools()
-    cat_df = tools[tools["category"] == cat].copy()
-
     # Admin add/update
-    if is_admin:
+    if st.session_state["is_admin"]:
         st.markdown("**Admin — Add or Update**")
-        a1, a2, a3 = st.columns([5,2,2])
-        with a1:
-            nm = st.text_input("Item name", key="new_tool_nm")
-        with a2:
-            qty = st.number_input("Quantity", min_value=0, step=1, value=0, key="new_tool_qty")
-        with a3:
-            st.write("")
-            if st.button("Save to selected category", use_container_width=True):
-                if not nm.strip():
-                    st.warning("Enter a name.")
-                else:
-                    upsert_tool(nm, cat, int(qty))
-                    st.success("Saved.")
-                    st.experimental_rerun()
+        with st.form("admin_add_update"):
+            new_tool = st.text_input("Item name")
+            new_qty = st.number_input("Quantity", min_value=0, value=0, step=1)
+            saved = st.form_submit_button("Save to selected category")
+            if saved and new_tool.strip():
+                upsert_tool(new_tool.strip(), active_cat, int(new_qty))
+                st.success(f"Saved '{new_tool}' to {active_cat}")
+                st.rerun()
 
-    if cat_df.empty:
+    q = st.text_input("Search items…", placeholder="Type to filter by name")
+    df = list_tools_by_category(active_cat)
+    if not df.empty and q:
+        df = df[df["name"].str.contains(q, case=False, na=False)]
+
+    if df.empty:
         st.info("No items found for this category.")
     else:
-        cat_df = cat_df.sort_values("name", key=lambda s: s.str.lower())
-        for _, row in cat_df.iterrows():
-            k = tool_key(row["name"], row["category"])
-            holders = current_holders(k)
-            avail = available_count(int(row["quantity"]), holders)
+        for _, row in df.iterrows():
+            tool_id = int(row["id"])
+            name = row["name"]
+            qty = int(row.get("quantity", 0) or 0)
+            current_out = int(row.get("current_out", 0) or 0)
+            available_qty = qty - current_out
+            holder = last_holder(tool_id)
 
-            with st.container():
-                st.markdown('<div class="tool-card">', unsafe_allow_html=True)
-                st.markdown(f"**{row['name']}**")
-
-                if avail > 0:
-                    st.markdown(
-                        f"<span class='chip ok'>Available</span> "
-                        f"<span class='muted'>&nbsp;({avail} of {row['quantity']})</span>",
-                        unsafe_allow_html=True
-                    )
+            status_html = ""
+            if available_qty > 0:
+                status_html = f"<span class='chip ok'>Available</span> ({available_qty})"
+            else:
+                if holder:
+                    status_html = f"<span class='chip bad'>Unavailable</span> — held by **{holder}**"
                 else:
-                    holder_names = ", ".join(sorted(set(holders))) if holders else "—"
-                    st.markdown(
-                        f"<span class='chip bad'>Unavailable</span> &nbsp;"
-                        f"Holder: **{holder_names}** "
-                        f"<span class='muted'>(total {row['quantity']})</span>",
-                        unsafe_allow_html=True
-                    )
+                    status_html = f"<span class='chip bad'>Unavailable</span>"
 
-                c1, c2, c3 = st.columns([1,1,2])
-                user = st.session_state.get("current_user","").strip() or "Guest"
-
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([4,2,3])
                 with c1:
-                    can_out = (avail > 0) and (user and user.lower() != "guest")
-                    if st.button("Check Out", key=f"out_{row['name']}_{row['category']}", disabled=not can_out, use_container_width=True):
-                        append_tx(datetime.now().isoformat(timespec="seconds"), user, "check_out", k, 1, "")
-                        # sync current_out for this tool
-                        sync_current_out_in_tools()
-                        st.experimental_rerun()
-
+                    st.markdown(f"**{name}**")
+                    st.caption(f"Total: {qty}  |  Out: {current_out}")
                 with c2:
-                    user_holds = user in holders
-                    can_in = user_holds or is_admin
-                    if st.button("Check In", key=f"in_{row['name']}_{row['category']}", disabled=not can_in, use_container_width=True):
-                        # Only if something is out
-                        if len(holders) > 0:
-                            actor = user if user_holds else (user if is_admin else "Unknown")
-                            append_tx(datetime.now().isoformat(timespec="seconds"), actor, "check_in", k, 1, "")
-                            sync_current_out_in_tools()
-                            st.experimental_rerun()
-
+                    st.markdown(status_html, unsafe_allow_html=True)
                 with c3:
-                    st.caption(f"Total Quantity: **{row['quantity']}**")
+                    user = st.session_state["current_user"]
+                    is_admin = st.session_state["is_admin"]
 
-                # Admin edit/delete
-                if is_admin:
-                    with st.expander("Admin — Edit / Delete", expanded=False):
-                        e1, e2, e3, e4 = st.columns([3,2,2,2])
-                        with e1:
-                            new_name = st.text_input("Rename", value=row["name"], key=f"rename_{row['name']}_{row['category']}")
-                        with e2:
-                            new_qty = st.number_input("Set quantity", min_value=0, value=int(row["quantity"]), step=1, key=f"setqty_{row['name']}_{row['category']}")
-                        with e3:
-                            if st.button("Update", key=f"upd_{row['name']}_{row['category']}", use_container_width=True):
-                                tools2 = load_tools()
-                                m = (tools2["name"]==row["name"]) & (tools2["category"]==row["category"])
-                                tools2.loc[m, "name"] = new_name.strip() or row["name"]
-                                tools2.loc[m, "quantity"] = int(new_qty)
-                                df_to_ws(tools2, ws_tools)
-                                sync_current_out_in_tools()
-                                st.success("Updated.")
-                                st.experimental_rerun()
-                        with e4:
-                            if st.button("Delete", key=f"del_{row['name']}_{row['category']}", use_container_width=True):
-                                delete_tool(row["name"], row["category"])
-                                st.success("Deleted.")
-                                st.experimental_rerun()
+                    colb1, colb2 = st.columns(2)
 
-                st.markdown('</div>', unsafe_allow_html=True)
-
-    # Admin — Manage Employees
-    if is_admin:
-        with st.expander("Admin — Manage Employees", expanded=False):
-            roster = load_roster().copy()
-            st.write("**Current roster**")
-            st.dataframe(roster, use_container_width=True, hide_index=True)
-            st.write("**Add new employee**")
-            r1, r2 = st.columns([3,1])
-            with r1:
-                new_emp = st.text_input("Full name", key="new_emp_name")
-            with r2:
-                if st.button("Add", key="add_emp_btn", use_container_width=True):
-                    nm = (new_emp or "").strip()
-                    if not nm:
-                        st.warning("Enter a name.")
-                    elif nm in roster["name"].values:
-                        st.info("Already on roster.")
+                    # CHECK OUT
+                    if available_qty > 0:
+                        if colb1.button("Check Out", key=f"out_{tool_id}_{name}"):
+                            ok = record_checkout(tool_id, user)
+                            if not ok:
+                                st.warning("No available quantity.")
+                            st.rerun()
                     else:
-                        roster.loc[len(roster)] = [nm, ""]
-                        save_roster(roster)
-                        st.success("Added.")
-                        st.experimental_rerun()
+                        colb1.button("Check Out", key=f"out_{tool_id}_{name}", disabled=True)
 
-            st.write("**Delete employee**")
-            for idx, r in roster.reset_index(drop=True).iterrows():
-                c1, c2 = st.columns([5,1])
-                with c1:
-                    st.text_input("Name", value=r["name"], key=f"ro_name_{idx}", disabled=True)
-                with c2:
-                    if st.button("Trash", key=f"ro_del_{idx}", use_container_width=True):
-                        roster = roster[roster["name"] != r["name"]]
-                        save_roster(roster)
-                        st.success("Removed.")
-                        st.experimental_rerun()
+                    # CHECK IN (only holder or admin)
+                    can_checkin = (current_out > 0) and (is_admin or (holder == user))
+                    if colb2.button("Check In", key=f"in_{tool_id}_{name}", disabled=not can_checkin):
+                        if can_checkin:
+                            record_checkin(tool_id, user)
+                            st.rerun()
+                        else:
+                            st.error("Only the current holder or admin can check this in.")
 
-# Activity log viewer
-with st.expander("Activity Log (latest 200)"):
-    tx = load_tx()
-    if tx.empty:
-        st.info("No activity yet.")
-    else:
-        st.dataframe(tx.sort_values("ts", ascending=False).head(200), use_container_width=True)
+# -----------------------------------------------------------------------------
+# Footer: tiny SQL patch viewer (optional)
+# -----------------------------------------------------------------------------
+st.divider()
+st.caption("© HUGE Handyman — simple inventory (PostgreSQL)")
