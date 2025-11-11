@@ -275,28 +275,60 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
 st.write(f"**Logged in as:** {st.session_state['current_user']}")
 
 # -----------------------------------------------------------------------------
-# Category Bar (single)
-# -----------------------------------------------------------------------------
+# ------------------------- Categories (single orange bar) ---------------------
+
+# 1) Make sure the category list exists
+CATEGORY_LABELS = [
+    "Power Tools",
+    "Hand Tools",
+    "Ladders",
+    "Extension Cords",
+    "Masking & Protection",
+    "Batteries",
+    "Blankets & Drop Cloths",
+    "Extra Material",
+    "Bags / Accessories",
+]
+
+# 2) Keep the current user visible (optional, keep or remove)
+st.write(f"**Logged in as:** {st.session_state.get('current_user', 'Guest')}")
+
+# 3) Active category state
 if "active_cat" not in st.session_state:
     st.session_state["active_cat"] = CATEGORY_LABELS[0]
 
-# One clean radio picker (no duplicates)
-active_cat = st.radio(
-    "Select Category",
-    CATEGORY_LABELS,
-    horizontal=True,
-    index=(
-        CATEGORY_LABELS.index(st.session_state["active_cat"])
-        if st.session_state["active_cat"] in CATEGORY_LABELS
-        else 0
-    ),
-    key="category_picker",  # ensures a stable widget key
+# 4) Style the orange pills just for this bar
+st.markdown(
+    """
+    <style>
+    .catbar { display:flex; flex-wrap:wrap; gap:10px; margin: 8px 0 18px; }
+    .catbar .stButton > button {
+        background: #E75B2A;
+        color: #fff;
+        border: 2px solid #E75B2A;
+        border-radius: 10px;
+        padding: 8px 14px;
+        font-weight: 700;
+    }
+    .catbar .stButton > button:hover { filter: brightness(1.08); }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# Keep session state in sync
-st.session_state["active_cat"] = active_cat
+# 5) Render ONE category bar (orange buttons)
+st.markdown('<div class="catbar">', unsafe_allow_html=True)
+cols = st.columns(len(CATEGORY_LABELS), gap="small")
+for i, label in enumerate(CATEGORY_LABELS):
+    with cols[i]:
+        if st.button(label, key=f"catbtn_{i}"):
+            st.session_state["active_cat"] = label
+st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
+
+# 6) Use the selected category from session_state
+st.subheader(st.session_state["active_cat"])
 
 # -----------------------------------------------------------------------------
 # Content
