@@ -305,8 +305,6 @@ except NameError:
 if "active_cat" not in st.session_state:
     st.session_state["active_cat"] = CATEGORY_LABELS[0]
 
-active_cat = st.session_state["active_cat"]
-active_label = active_cat
                      # if your code checks active_label anywhere
 
 # 3) Active category state
@@ -344,12 +342,11 @@ st.markdown("</div>", unsafe_allow_html=True)
 st.divider()
 
 # 6) Use the selected category from session_state
-st.subheader(st.session_state["active_cat"])
+st.subheader(active_cat)
 
 # -----------------------------------------------------------------------------
 # Content
 # -----------------------------------------------------------------------------
-st.subheader(st.session_state["active_cat"])
 
 # Text-entry categories
 if active_cat in TEXT_LOGS:
