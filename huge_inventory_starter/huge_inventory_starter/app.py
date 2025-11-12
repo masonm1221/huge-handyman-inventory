@@ -330,18 +330,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 5) Render ONE category bar (orange buttons)
+# ---------- Single source of truth for selected category ----------
+# Ensure state exists (do this once, above the bar if you like)
+if "active_cat" not in st.session_state:
+    st.session_state["active_cat"] = CATEGORY_LABELS[0]
+active_cat = st.session_state["active_cat"]
+
+# Render the orange category bar (ONE bar, with immediate rerun)
 st.markdown('<div class="catbar">', unsafe_allow_html=True)
 cols = st.columns(len(CATEGORY_LABELS), gap="small")
 for i, label in enumerate(CATEGORY_LABELS):
     with cols[i]:
         if st.button(label, key=f"catbtn_{i}"):
             st.session_state["active_cat"] = label
-st.markdown("</div>", unsafe_allow_html=True)
+            st.rerun()  # <- makes the change apply on the first click
+st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
 
-# 6) Use the selected category from session_state
+# ---------- The ONLY category header ----------
 st.subheader(active_cat)
 
 # -----------------------------------------------------------------------------
