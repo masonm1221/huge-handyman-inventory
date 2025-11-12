@@ -200,6 +200,54 @@ def log_text(which: str, user_name: str, entry: str):
 
 def read_log(table: str, limit: int = 50) -> pd.DataFrame:
     return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
+# ---- Activity log reader (admin)
+def read_activity_log(
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    user: str | None = None,
+    category: str | None = None,
+    search_tool: str | None = None,
+    limit: int = 200,
+) -> pd.DataFrame:
+    """
+    Returns the latest activity joined with tool names & categories.
+    Works on both Postgres and SQLite.
+    """
+    base = """
+        select
+            tr.ts,
+            tr.user_name,
+            tr.action,
+            t.name as tool,
+            t.category
+        from transactions tr
+        join tools t on t.id = tr.tool_id
+        where 1=1
+    """
+
+    params: dict[str, object] = {}
+
+    if date_from:
+        base += " and tr.ts >= :df"
+        params["df"] = date_from
+    if date_to:
+        base += " and tr.ts < :dt"
+        params["dt"] = date_to
+    if user and user != "—":
+        base += " and tr.user_name = :u"
+        params["u"] = user
+    if category and category != "—":
+        base += " and t.category = :c"
+        params["c"] = category
+    if search_tool:
+        # case-insensitive search that works on Postgres and SQLite
+        base += " and lower(t.name) like :q"
+        params["q"] = f"%{search_tool.lower()}%"
+
+    base += " order by tr.ts desc limit :lim"
+    params["lim"] = int(limit)
+
+    return db_read_df(base, params)
 
 # Roster
 def list_users() -> list[str]:
