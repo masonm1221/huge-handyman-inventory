@@ -327,25 +327,34 @@ active_cat = st.session_state["active_cat"]
 st.subheader(active_cat)
 
 # -----------------------------------------------------------------------------
-# “My Checked-Out Tools” quick panel
-# -----------------------------------------------------------------------------
+# --- My Checked-Out Tools (robust) ---
 my_name = st.session_state.get("current_user", "Guest")
 if my_name and my_name != "Guest":
     my_df = db_read_df(
         """
+        WITH last_tx AS (
+            SELECT
+                tr.tool_id,
+                tr.user_name,
+                tr.action,
+                tr.ts,
+                ROW_NUMBER() OVER (
+                    PARTITION BY tr.tool_id
+                    ORDER BY tr.ts DESC, tr.id DESC
+                ) AS rn
+            FROM transactions tr
+        )
         SELECT t.id, t.name, t.category
         FROM tools t
-        JOIN (
-            SELECT tool_id, MAX(ts) AS last_ts
-            FROM transactions
-            GROUP BY tool_id
-        ) last ON last.tool_id = t.id
-        JOIN transactions tr ON tr.tool_id = t.id AND tr.ts = last.last_ts
-        WHERE tr.action = 'check_out' AND tr.user_name = :u
+        JOIN last_tx lt
+          ON lt.tool_id = t.id AND lt.rn = 1
+        WHERE lt.action = 'check_out'
+          AND lt.user_name = :u
         ORDER BY t.category, t.name
         """,
         {"u": my_name}
     )
+
     with st.expander(f"Your current tools ({len(my_df)})", expanded=False):
         if my_df.empty:
             st.caption("You have no tools checked out.")
