@@ -201,6 +201,20 @@ def log_text(which: str, user_name: str, entry: str):
 def read_log(table: str, limit: int = 50) -> pd.DataFrame:
     return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
 
+def read_activity_log(limit: int = 200) -> pd.DataFrame:
+    sql = """
+    select
+        tr.ts,
+        tr.user_name,
+        tr.action,
+        coalesce(tools.name, concat('ID ', tr.tool_id)) as tool
+    from transactions tr
+    left join tools on tools.id = tr.tool_id
+    order by tr.ts desc
+    limit :lim
+    """
+    return db_read_df(sql, {"lim": limit})
+
 # Roster
 def list_users() -> list[str]:
     df = db_read_df("select name from users order by name")
@@ -442,6 +456,38 @@ else:
                             st.rerun()
                         else:
                             st.error("Only the current holder or admin can check this in.")
+
+st.divider()
+if st.session_state.get("is_admin"):
+    with st.expander("Admin — Activity Log (last 200)", expanded=False):
+        log_df = read_activity_log(200)
+
+        if log_df.empty:
+            st.info("No activity yet.")
+        else:
+            # Nice labels & ordering
+            log_df["Action"] = log_df["action"].map({
+                "check_out": "Checked Out",
+                "check_in": "Checked In"
+            }).fillna(log_df["action"])
+            log_df = log_df.rename(columns={
+                "ts": "When (UTC)",
+                "user_name": "Who",
+                "tool": "Tool"
+            })
+            log_df = log_df[["When (UTC)", "Who", "Tool", "Action"]]
+
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+
+            # Optional: quick CSV export
+            csv = log_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv,
+                file_name="activity_log.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
 # -----------------------------------------------------------------------------
 # Footer: tiny SQL patch viewer (optional)
