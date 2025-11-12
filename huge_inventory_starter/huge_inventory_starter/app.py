@@ -1,6 +1,6 @@
 # Author: HUGE Handyman + ChatGPT
 # Streamlit + PostgreSQL (SQLAlchemy)
-# Inventory: simple categories; show holder; restricted check-in; blue/orange theme
+# Inventory app with single category bar, admin edit/delete, and activity log viewer
 
 import os
 from datetime import datetime
@@ -29,27 +29,27 @@ st.markdown(
       .hh-left {{display:flex;align-items:center;gap:16px;}}
       .hh-title {{font-weight: 800; font-size: 22px; color: {HUGE_DARK}; letter-spacing: .5px;}}
 
-      .hh-catbar {{ display:flex; flex-wrap: wrap; gap:10px; margin: 10px 0 6px 0; z-index:1; position:relative; }}
-      .hh-cat {{
-        background: white; color:{HUGE_BLUE}; padding:10px 16px; border-radius:10px; font-weight:700;
-        border:2px solid {HUGE_BLUE}; cursor:pointer; user-select:none; font-size:15px;
-      }}
-      .hh-cat.active {{ background:{HUGE_BLUE}; color:white; }}
-
       .chip {{ display:inline-block; padding:4px 10px; border-radius:999px; font-weight:700; font-size:12px; color:white; }}
       .chip.ok {{ background:#16a34a; }}
       .chip.bad {{ background:#dc2626; }}
       .chip.warn {{ background:#f59e0b; color:#111; }}
-
-      .hh-card {{ background:#fff; border:1px solid #eee; border-radius:12px; padding:12px; margin-bottom:8px; }}
 
       .stButton>button {{ border-radius:10px; border:2px solid {HUGE_BLUE}; color:{HUGE_BLUE}; }}
       .stButton>button:hover {{ filter: brightness(1.05); }}
       div.stButton>button[kind="secondary"] {{ border:2px solid {HUGE_ORANGE}; color:{HUGE_ORANGE}; }}
       div.stButton>button[kind="primary"] {{ background:{HUGE_BLUE}; color:white; border:2px solid {HUGE_BLUE}; }}
 
-      /* radio row spacing */
-      .stRadio > div{{ flex-direction:row; gap:18px; }}
+      /* Orange category bar */
+      .catbar {{ display:flex; flex-wrap:wrap; gap:10px; margin: 8px 0 18px; }}
+      .catbar .stButton > button {{
+          background: {HUGE_ORANGE};
+          color: #fff;
+          border: 2px solid {HUGE_ORANGE};
+          border-radius: 10px;
+          padding: 8px 14px;
+          font-weight: 700;
+      }}
+      .catbar .stButton > button:hover {{ filter: brightness(1.08); }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -145,6 +145,28 @@ def upsert_tool(name: str, category: str, quantity: int):
         {"n": name.strip(), "c": category, "q": int(quantity)},
     )
 
+def update_tool_fields(tool_id: int, name: str, category: str, quantity: int):
+    """Update name, category, and quantity for a given tool."""
+    db_exec(
+        """
+        update tools
+           set name = :n,
+               category = :c,
+               quantity = :q
+         where id = :tid
+        """,
+        {"n": name.strip(), "c": category, "q": int(quantity), "tid": tool_id},
+    )
+
+def delete_tool(tool_id: int, delete_history: bool = False):
+    """
+    Delete a tool. If delete_history=True, also remove its transactions.
+    (If you want to preserve history, leave delete_history=False.)
+    """
+    if delete_history:
+        db_exec("delete from transactions where tool_id = :tid", {"tid": tool_id})
+    db_exec("delete from tools where id = :tid", {"tid": tool_id})
+
 def list_tools_by_category(cat: str) -> pd.DataFrame:
     df = db_read_df("select * from tools where category = :c order by name", {"c": cat})
     if not df.empty:
@@ -152,7 +174,6 @@ def list_tools_by_category(cat: str) -> pd.DataFrame:
     return df
 
 def record_checkout(tool_id: int, user_name: str) -> bool:
-    # only allow if available > 0
     df = db_read_df("select quantity, current_out from tools where id = :tid", {"tid": tool_id})
     if df.empty:
         return False
@@ -167,7 +188,6 @@ def record_checkout(tool_id: int, user_name: str) -> bool:
     return True
 
 def record_checkin(tool_id: int, user_name: str) -> bool:
-    # Only current holder or admin can check in (admin check in UI)
     db_exec("update tools set current_out = greatest(current_out - 1, 0) where id = :tid", {"tid": tool_id})
     db_exec(
         "insert into transactions(tool_id, user_name, action) values (:tid, :u, 'check_in')",
@@ -176,14 +196,13 @@ def record_checkin(tool_id: int, user_name: str) -> bool:
     return True
 
 def last_holder(tool_id: int) -> str | None:
-    # last action determines holder; if last is check_out => that user holds it
     df = db_read_df(
         """
         select user_name, action
-        from transactions
-        where tool_id = :tid
-        order by ts desc
-        limit 1
+          from transactions
+         where tool_id = :tid
+         order by ts desc
+         limit 1
         """,
         {"tid": tool_id},
     )
@@ -201,17 +220,18 @@ def log_text(which: str, user_name: str, entry: str):
 def read_log(table: str, limit: int = 50) -> pd.DataFrame:
     return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
 
-def read_activity_log(limit: int = 200) -> pd.DataFrame:
+def read_transactions(limit: int = 100) -> pd.DataFrame:
+    # Join to show tool names with actions
     sql = """
-    select
-        tr.ts,
-        tr.user_name,
-        tr.action,
-        coalesce(tools.name, concat('ID ', tr.tool_id)) as tool
-    from transactions tr
-    left join tools on tools.id = tr.tool_id
-    order by tr.ts desc
-    limit :lim
+        select t.ts,
+               t.user_name,
+               case t.action when 'check_out' then 'Checked Out' when 'check_in' then 'Checked In' end as action,
+               coalesce(z.name, concat('Tool #', t.tool_id::text)) as tool_name
+          from transactions t
+     left join tools z
+            on z.id = t.tool_id
+         order by t.ts desc
+         limit :lim;
     """
     return db_read_df(sql, {"lim": limit})
 
@@ -236,6 +256,8 @@ if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
 if "current_user" not in st.session_state:
     st.session_state["current_user"] = "Guest"
+if "active_cat" not in st.session_state:
+    st.session_state["active_cat"] = CATEGORIES[0]
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
@@ -287,90 +309,30 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
             st.rerun()
 
 # -----------------------------------------------------------------------------
-# ------------------------- Categories (single orange bar) ---------------------
+# Logged-in user line
+# -----------------------------------------------------------------------------
+st.caption(f"Logged in as: **{st.session_state.get('current_user', 'Guest')}**")
 
-# 2) Keep the current user visible (optional, keep or remove)
-# ------------------------------------------------------------------
-# Logged in as (show once)
-# ------------------------------------------------------------------
-st.write(f"Logged in as: {st.session_state.get('current_user', 'Guest')}")
-
-# ------------------------------------------------------------------
-# Category definitions (guarded so app won't crash if not defined)
-# ------------------------------------------------------------------
-try:
-    CATEGORY_LABELS  # already present somewhere else
-except NameError:
-    CATEGORY_LABELS = [
-        "Power Tools",
-        "Hand Tools",
-        "Ladders",
-        "Extension Cords",
-        "Masking & Protection",
-        "Batteries",
-        "Blankets & Drop Cloths",
-        "Extra Material",
-        "Bags / Accessories",
-    ]
-
-# ------------------------------------------------------------------
-# Session state for selected category
-# ------------------------------------------------------------------
-if "active_cat" not in st.session_state:
-    st.session_state["active_cat"] = CATEGORY_LABELS[0]
-
-                     # if your code checks active_label anywhere
-
-# 3) Active category state
-if "active_cat" not in st.session_state:
-    st.session_state["active_cat"] = CATEGORY_LABELS[0]
-
-# 4) Style the orange pills just for this bar
-st.markdown(
-    """
-    <style>
-    .catbar { display:flex; flex-wrap:wrap; gap:10px; margin: 8px 0 18px; }
-    .catbar .stButton > button {
-        background: #E75B2A;
-        color: #fff;
-        border: 2px solid #E75B2A;
-        border-radius: 10px;
-        padding: 8px 14px;
-        font-weight: 700;
-    }
-    .catbar .stButton > button:hover { filter: brightness(1.08); }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------- Single source of truth for selected category ----------
-# Ensure state exists (do this once, above the bar if you like)
-if "active_cat" not in st.session_state:
-    st.session_state["active_cat"] = CATEGORY_LABELS[0]
-active_cat = st.session_state["active_cat"]
-
-# Render the orange category bar (ONE bar, with immediate rerun)
+# -----------------------------------------------------------------------------
+# Category bar (single, orange)
+# -----------------------------------------------------------------------------
 st.markdown('<div class="catbar">', unsafe_allow_html=True)
-cols = st.columns(len(CATEGORY_LABELS), gap="small")
-for i, label in enumerate(CATEGORY_LABELS):
+cols = st.columns(len(CATEGORIES), gap="small")
+for i, label in enumerate(CATEGORIES):
     with cols[i]:
         if st.button(label, key=f"catbtn_{i}"):
             st.session_state["active_cat"] = label
-            st.rerun()  # <- makes the change apply on the first click
-st.markdown('</div>', unsafe_allow_html=True)
+            st.rerun()   # Immediate UI update (prevents double-click)
+st.markdown("</div>", unsafe_allow_html=True)
 
-st.divider()
-
-# ---------- The ONLY category header ----------
+active_cat = st.session_state["active_cat"]
 st.subheader(active_cat)
 
 # -----------------------------------------------------------------------------
-# Content
+# Content for the selected category
 # -----------------------------------------------------------------------------
-
-# Text-entry categories
 if active_cat in TEXT_LOGS:
+    # Text-entry categories
     table = TEXT_LOGS[active_cat]
     with st.form(f"log_form_{table}"):
         entry = st.text_input("Describe what you’re taking:", placeholder="e.g., 1 Milwaukee bag with 2 fine tool blades")
@@ -386,8 +348,8 @@ if active_cat in TEXT_LOGS:
     else:
         st.dataframe(logs, use_container_width=True)
 
-# Tool categories
 else:
+    # Tools category
     # Admin add/update
     if st.session_state["is_admin"]:
         st.markdown("**Admin — Add or Update**")
@@ -457,42 +419,49 @@ else:
                         else:
                             st.error("Only the current holder or admin can check this in.")
 
-st.divider()
-if st.session_state.get("is_admin"):
-    with st.expander("Admin — Activity Log (last 200)", expanded=False):
-        log_df = read_activity_log(200)
+                # ---------- Admin: Edit / Delete ----------
+                if st.session_state["is_admin"]:
+                    with st.expander("Admin: edit / delete", expanded=False):
+                        new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
+                        new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
+                        new_cat = st.selectbox(
+                            "Category",
+                            CATEGORIES,
+                            index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
+                            key=f"ct_{tool_id}",
+                        )
+                        cols_admin = st.columns([1,1,1])
+                        if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
+                            try:
+                                update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
+                                st.success("Updated.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not update: {e}")
 
-        if log_df.empty:
-            st.info("No activity yet.")
-        else:
-            # Nice labels & ordering
-            log_df["Action"] = log_df["action"].map({
-                "check_out": "Checked Out",
-                "check_in": "Checked In"
-            }).fillna(log_df["action"])
-            log_df = log_df.rename(columns={
-                "ts": "When (UTC)",
-                "user_name": "Who",
-                "tool": "Tool"
-            })
-            log_df = log_df[["When (UTC)", "Who", "Tool", "Action"]]
-
-            st.dataframe(log_df, use_container_width=True, hide_index=True)
-
-            # Optional: quick CSV export
-            csv = log_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download CSV",
-                data=csv,
-                file_name="activity_log.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+                        delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
+                        if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
+                            try:
+                                delete_tool(tool_id, delete_history=delete_history)
+                                st.warning("Tool deleted.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not delete: {e}")
 
 # -----------------------------------------------------------------------------
-# Footer: tiny SQL patch viewer (optional)
+# Admin Activity Log (read-only)
+# -----------------------------------------------------------------------------
+if st.session_state["is_admin"]:
+    with st.expander("Admin — Activity Log (last 100)", expanded=False):
+        tx = read_transactions(limit=100)
+        if tx.empty:
+            st.info("No transactions yet.")
+        else:
+            tx = tx.rename(columns={"ts": "Timestamp", "user_name": "User", "action": "Action", "tool_name": "Tool"})
+            st.dataframe(tx, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# Footer
 # -----------------------------------------------------------------------------
 st.divider()
 st.caption("© HUGE Handyman — simple inventory (PostgreSQL)")
-
-
