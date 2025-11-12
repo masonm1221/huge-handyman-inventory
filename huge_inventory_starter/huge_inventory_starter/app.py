@@ -126,6 +126,8 @@ CATEGORIES = [
     "Blankets & Drop Cloths",
     "Extra Material",
     "Bags / Accessories",
+    "Vacuums / Fans"
+    "Uncommon Tools"
 ]
 
 TEXT_LOGS = {
