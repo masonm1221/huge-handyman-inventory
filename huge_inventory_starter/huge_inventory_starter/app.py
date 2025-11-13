@@ -436,25 +436,8 @@ if my_name and my_name != "Guest":
 # -----------------------------------------------------------------------------
 # Content for the selected category
 # -----------------------------------------------------------------------------
-if active_cat in TEXT_LOGS:
-    # Text-entry categories
-    table = TEXT_LOGS[active_cat]
-    with st.form(f"log_form_{table}"):
-        entry = st.text_input("Describe what you’re taking:", placeholder="e.g., 1 Milwaukee bag with 2 fine tool blades")
-        submitted = st.form_submit_button("Submit")
-        if submitted and entry.strip():
-            log_text("extra" if table == "extra_material_log" else "bags", st.session_state["current_user"], entry)
-            st.success("Logged successfully!")
-            st.rerun()
-
-    logs = read_log(table, limit=50)
-    if logs.empty:
-        st.info("No entries yet.")
-    else:
-        st.dataframe(logs, use_container_width=True)
-
 else:
-    # Tools category
+    # -------------------- Tools category --------------------
     # Admin add/update
     if st.session_state["is_admin"]:
         st.markdown("**Admin — Add or Update**")
@@ -467,163 +450,54 @@ else:
                 st.success(f"Saved '{new_tool}' to {active_cat}")
                 st.rerun()
 
+    # Search
     q = st.text_input("Search items…", placeholder="Type to filter by name")
     df = list_tools_by_category(active_cat)
     if not df.empty and q:
         df = df[df["name"].str.contains(q, case=False, na=False)]
 
+    # No rows?
     if df.empty:
         st.info("No items found for this category.")
     else:
-    # Tools exist for this category
-    for _, row in df.iterrows():   # <-- colon here
-        tool_id = int(row["id"])   # <-- 4 spaces in from the 'for' line
-        name = row["name"]
-        qty = int(row.get("quantity", 0) or 0)
-        current_out = int(row.get("current_out", 0) or 0)
-        available_qty = qty - current_out
-        holder = last_holder(tool_id)
+        # ------------ BEGIN TOOL CARDS ------------
+        for _, row in df.iterrows():
+            tool_id = int(row["id"])
+            name = row["name"]
+            qty = int(row.get("quantity", 0) or 0)
+            current_out = int(row.get("current_out", 0) or 0)
+            available_qty = qty - current_out
+            holder = last_holder(tool_id)
 
-        status_html = ""
-        if available_qty > 0:
-            status_html = f"<span class='chip ok'>Available</span> ({available_qty})"
-        else:
-            if holder:
-                status_html = f"<span class='chip bad'>Unavailable</span> — held by **{holder}**"
+            if available_qty > 0:
+                status_html = f"<span class='chip ok'>Available</span> ({available_qty})"
             else:
-                status_html = f"<span class='chip bad'>Unavailable</span>"
-
-        # ===== Card for this tool =====
-        with st.container(border=True):
-            # 4 columns: image | info | status | actions
-            c0, c1, c2, c3 = st.columns([1, 4, 2, 3])
-
-            # --- Image column ---
-            with c0:
-                img_shown = False
-                if "image_bytes" in row and row["image_bytes"] is not None:
-                    try:
-                        st.image(row["image_bytes"], use_column_width=True)
-                        img_shown = True
-                    except Exception:
-                        pass
-                if (not img_shown) and ("image_url" in row) and row["image_url"]:
-                    try:
-                        st.image(row["image_url"], use_column_width=True)
-                        img_shown = True
-                    except Exception:
-                        pass
-                if not img_shown:
-                    st.caption("No image")
-
-            # --- Info column ---
-            with c1:
-                st.markdown(f"**{name}**")
-                st.caption(f"Total: {qty}  |  Out: {current_out}")
-
-            # --- Status column ---
-            with c2:
-                st.markdown(status_html, unsafe_allow_html=True)
-
-            # --- Actions column ---
-            with c3:
-                user = st.session_state["current_user"]
-                is_admin = st.session_state["is_admin"]
-
-                colb1, colb2 = st.columns(2)
-
-                # CHECK OUT
-                if available_qty > 0:
-                    if colb1.button("Check Out", key=f"out_{tool_id}_{name}"):
-                        ok = record_checkout(tool_id, user)
-                        if not ok:
-                            st.warning("No available quantity.")
-                        st.rerun()
+                if holder:
+                    status_html = f"<span class='chip bad'>Unavailable</span> — held by **{holder}**"
                 else:
-                    colb1.button("Check Out", key=f"out_{tool_id}_{name}", disabled=True)
+                    status_html = "<span class='chip bad'>Unavailable</span>"
 
-                # CHECK IN (only holder or admin)
-                can_checkin = (current_out > 0) and (is_admin or (holder == user))
-                if colb2.button("Check In", key=f"in_{tool_id}_{name}", disabled=not can_checkin):
-                    if can_checkin:
-                        record_checkin(tool_id, user)
-                        st.rerun()
-                    else:
-                        st.error("Only the current holder or admin can check this in.")
+            with st.container(border=True):
+                # 3 columns: info | status | actions
+                c1, c2, c3 = st.columns([4, 2, 3])
 
-    # ---------- Admin: Edit / Delete ----------
-    if st.session_state["is_admin"]:
-        with st.expander("Admin: edit / delete", expanded=False):
-            new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
-            new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
-            new_cat = st.selectbox(
-                "Category",
-                CATEGORIES,
-                index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
-                key=f"ct_{tool_id}",
-            )
-            cols_admin = st.columns([1, 1, 1])
-            if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
-                try:
-                    update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
-                    st.success("Updated.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not update: {e}")
+                # --- Info (name, quantities)
+                with c1:
+                    st.markdown(f"**{name}**")
+                    st.caption(f"Total: {qty}  |  Out: {current_out}")
 
-            delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
-            if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
-                try:
-                    delete_tool(tool_id, delete_history=delete_history)
-                    st.warning("Tool deleted.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not delete: {e}")
+                # --- Status chip
+                with c2:
+                    st.markdown(status_html, unsafe_allow_html=True)
 
-    # ---------- Admin: Edit / Delete ----------
-    if st.session_state["is_admin"]:
-        with st.expander("Admin: edit / delete", expanded=False):
-            new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
-            new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
-            new_cat = st.selectbox(
-                "Category",
-                CATEGORIES,
-                index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
-                key=f"ct_{tool_id}",
-            )
+                # --- Actions
+                with c3:
+                    user = st.session_state["current_user"]
+                    is_admin = st.session_state["is_admin"]
 
-            # --- Image upload (replace or add) ---
-            st.markdown("—")
-            st.caption("Image (upload to replace)")
-            up = st.file_uploader("Upload JPG/PNG/WebP", type=["jpg","jpeg","png","webp"], key=f"upload_{tool_id}")
-            if up and st.button("Save image", key=f"saveimg_{tool_id}"):
-                raw = up.getvalue()
-                db_exec(
-                    "UPDATE tools SET image_bytes = :b, image_mime = :m, image_url = NULL WHERE id = :tid",
-                    {"b": raw, "m": (up.type or "application/octet-stream"), "tid": tool_id}
-                )
-                st.success("Image saved.")
-                st.rerun()
+                    colb1, colb2 = st.columns(2)
 
-            cols_admin = st.columns([1,1,1])
-            if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
-                try:
-                    update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
-                    st.success("Updated.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not update: {e}")
-
-            delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
-            if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
-                try:
-                    delete_tool(tool_id, delete_history=delete_history)
-                    st.warning("Tool deleted.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not delete: {e}")
-
-                    # CHECK OUT
+                    # Check Out
                     if available_qty > 0:
                         if colb1.button("Check Out", key=f"out_{tool_id}_{name}"):
                             ok = record_checkout(tool_id, user)
@@ -633,7 +507,7 @@ else:
                     else:
                         colb1.button("Check Out", key=f"out_{tool_id}_{name}", disabled=True)
 
-                    # CHECK IN (only holder or admin)
+                    # Check In (only holder or admin)
                     can_checkin = (current_out > 0) and (is_admin or (holder == user))
                     if colb2.button("Check In", key=f"in_{tool_id}_{name}", disabled=not can_checkin):
                         if can_checkin:
@@ -642,34 +516,35 @@ else:
                         else:
                             st.error("Only the current holder or admin can check this in.")
 
-                # ---------- Admin: Edit / Delete ----------
-                if st.session_state["is_admin"]:
-                    with st.expander("Admin: edit / delete", expanded=False):
-                        new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
-                        new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
-                        new_cat = st.selectbox(
-                            "Category",
-                            CATEGORIES,
-                            index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
-                            key=f"ct_{tool_id}",
-                        )
-                        cols_admin = st.columns([1,1,1])
-                        if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
-                            try:
-                                update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
-                                st.success("Updated.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Could not update: {e}")
+            # --- Admin: edit / delete expander ---
+            if st.session_state["is_admin"]:
+                with st.expander("Admin: edit / delete", expanded=False):
+                    new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
+                    new_qty  = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
+                    new_cat  = st.selectbox(
+                        "Category",
+                        CATEGORIES,
+                        index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
+                        key=f"ct_{tool_id}",
+                    )
+                    cols_admin = st.columns([1,1,1])
+                    if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
+                        try:
+                            update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
+                            st.success("Updated.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not update: {e}")
 
-                        delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
-                        if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
-                            try:
-                                delete_tool(tool_id, delete_history=delete_history)
-                                st.warning("Tool deleted.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Could not delete: {e}")
+                    delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
+                    if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
+                        try:
+                            delete_tool(tool_id, delete_history=delete_history)
+                            st.warning("Tool deleted.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not delete: {e}")
+        # ------------ END TOOL CARDS ------------
 
 # -----------------------------------------------------------------------------
 # Admin Activity Log (read-only)
