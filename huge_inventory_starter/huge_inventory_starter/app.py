@@ -1,7 +1,6 @@
 # Author: HUGE Handyman + ChatGPT
 # Streamlit + PostgreSQL (SQLAlchemy)
-# Inventory app with single category bar, admin edit/delete, activity log viewer
-# + tool images (upload/remove) stored in DB as bytes
+# Inventory app with single category bar, admin edit/delete, image upload, and activity log viewer
 
 import os
 from datetime import datetime
@@ -99,27 +98,15 @@ def init_db():
         entry text,
         ts timestamptz default now()
     );
+
+    -- Add image columns if missing (Postgres supports IF NOT EXISTS)
+    alter table tools add column if not exists image_bytes bytea;
+    alter table tools add column if not exists image_mime  text;
     """
     with engine.begin() as conn:
         for stmt in schema_sql.strip().split(";\n\n"):
-            conn.execute(text(stmt + ";"))
-
-        # ---- Image columns migration (safe no-op if already exist) ----
-        # Postgres supports "IF NOT EXISTS" for add column. SQLite doesn't until 3.35,
-        # so fall back to a try/except second form for SQLite.
-        try:
-            conn.execute(text("alter table tools add column if not exists image_bytes bytea;"))
-            conn.execute(text("alter table tools add column if not exists image_mime text;"))
-        except Exception:
-            # SQLite path (adds columns if they don't yet exist)
-            try:
-                conn.execute(text("alter table tools add column image_bytes blob;"))
-            except Exception:
-                pass
-            try:
-                conn.execute(text("alter table tools add column image_mime text;"))
-            except Exception:
-                pass
+            if stmt.strip():
+                conn.execute(text(stmt + ";"))
 
 init_db()
 
@@ -131,18 +118,26 @@ def db_exec(sql: str, params: dict | None = None):
     with engine.begin() as conn:
         conn.execute(text(sql), params or {})
 
-# ---- Image helpers -----------------------------------------------------------
-def set_tool_image(tool_id: int, image_bytes: bytes, mime: str):
-    db_exec(
-        "update tools set image_bytes = :b, image_mime = :m where id = :tid",
-        {"b": image_bytes, "m": mime, "tid": tool_id},
-    )
+# --- image-byte helper (handles Postgres memoryview etc.) ---
+def _as_bytes(blob):
+    if blob is None:
+        return None
+    if isinstance(blob, (bytes, bytearray)):
+        return bytes(blob)
+    try:
+        return bytes(blob)  # memoryview and other buffer-protocol types
+    except Exception:
+        return None
 
-def clear_tool_image(tool_id: int):
-    db_exec(
-        "update tools set image_bytes = NULL, image_mime = NULL where id = :tid",
-        {"tid": tool_id},
-    )
+# small helper for upload
+def _read_upload(uploaded_file):
+    """Return (bytes, mime) or (None, None)."""
+    if not uploaded_file:
+        return None, None
+    data = uploaded_file.read()
+    if not data:
+        return None, None
+    return data, uploaded_file.type or "application/octet-stream"
 
 # -----------------------------------------------------------------------------
 # Data helpers
@@ -191,11 +186,21 @@ def update_tool_fields(tool_id: int, name: str, category: str, quantity: int):
         {"n": name.strip(), "c": category, "q": int(quantity), "tid": tool_id},
     )
 
+def update_tool_image(tool_id: int, img_bytes: bytes | None, img_mime: str | None):
+    """Set or clear image for a tool (pass None to clear)."""
+    if img_bytes is None:
+        db_exec(
+            "update tools set image_bytes = NULL, image_mime = NULL where id = :tid",
+            {"tid": tool_id},
+        )
+    else:
+        db_exec(
+            "update tools set image_bytes = :b, image_mime = :m where id = :tid",
+            {"b": img_bytes, "m": img_mime, "tid": tool_id},
+        )
+
 def delete_tool(tool_id: int, delete_history: bool = False):
-    """
-    Delete a tool. If delete_history=True, also remove its transactions.
-    (If you want to preserve history, leave delete_history=False.)
-    """
+    """Delete a tool. If delete_history=True, also remove its transactions."""
     if delete_history:
         db_exec("delete from transactions where tool_id = :tid", {"tid": tool_id})
     db_exec("delete from tools where id = :tid", {"tid": tool_id})
@@ -254,7 +259,6 @@ def read_log(table: str, limit: int = 50) -> pd.DataFrame:
     return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
 
 def read_transactions(limit: int = 100) -> pd.DataFrame:
-    # Join to show tool names with actions
     sql = """
         select t.ts,
                t.user_name,
@@ -364,7 +368,6 @@ st.subheader(active_cat)
 # --- “My Checked-Out Tools” (for the logged-in user) ---
 my_name = st.session_state.get("current_user", "Guest")
 if my_name and my_name != "Guest":
-    # Latest transaction per tool for this user (still out)
     my_df = db_read_df(
         """
         WITH last_tx AS (
@@ -446,12 +449,17 @@ else:
         st.info("No items found for this category.")
     else:
         for _, row in df.iterrows():
-            tool_id = int(row["id"])
-            name = row["name"]
-            qty = int(row.get("quantity", 0) or 0)
+            tool_id     = int(row["id"])
+            name        = row["name"]
+            qty         = int(row.get("quantity", 0) or 0)
             current_out = int(row.get("current_out", 0) or 0)
             available_qty = qty - current_out
-            holder = last_holder(tool_id)
+            holder      = last_holder(tool_id)
+
+            # --- safe image bytes (handles Postgres memoryview) ---
+            raw_blob   = row.get("image_bytes", None)
+            img_bytes  = _as_bytes(raw_blob)      # <— critical fix
+            img_mime   = row.get("image_mime", None)
 
             status_html = ""
             if available_qty > 0:
@@ -463,26 +471,20 @@ else:
                     status_html = f"<span class='chip bad'>Unavailable</span>"
 
             with st.container(border=True):
-                # --- Layout: small image | name | status | actions
-                c0, c1, c2, c3 = st.columns([1.4, 4, 2, 3])
+                c0, c1, c2, c3 = st.columns([1,4,2,3])
 
-                # Image preview (if present)
-                img_bytes = row.get("image_bytes", None)
-                img_mime = row.get("image_mime", None)
+                # small thumbnail
                 with c0:
                     if img_bytes:
-                        st.image(img_bytes, width=90, caption=None, use_column_width=False)
+                        st.image(img_bytes, width=90, use_column_width=False)
 
-                # Info
                 with c1:
                     st.markdown(f"**{name}**")
                     st.caption(f"Total: {qty}  |  Out: {current_out}")
 
-                # Status
                 with c2:
                     st.markdown(status_html, unsafe_allow_html=True)
 
-                # Actions
                 with c3:
                     user = st.session_state["current_user"]
                     is_admin = st.session_state["is_admin"]
@@ -508,9 +510,9 @@ else:
                         else:
                             st.error("Only the current holder or admin can check this in.")
 
-                # ---------- Admin: Edit / Delete + Image Upload ----------
+                # ---------- Admin: Edit / Delete (+ image upload/remove) ----------
                 if st.session_state["is_admin"]:
-                    with st.expander("Admin: edit / delete / image", expanded=False):
+                    with st.expander("Admin: edit / delete", expanded=False):
                         new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
                         new_qty  = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
                         new_cat  = st.selectbox(
@@ -520,38 +522,38 @@ else:
                             key=f"ct_{tool_id}",
                         )
 
-                        # --- Image upload / remove ---
-                        st.markdown("**Tool image**")
-                        if img_bytes:
-                            st.image(img_bytes, width=140)
-                            rem_col, up_col = st.columns([1,2])
-                            if rem_col.button("Remove image", key=f"rm_img_{tool_id}"):
-                                clear_tool_image(tool_id)
-                                st.success("Image removed.")
-                                st.rerun()
-                        # Upload new/replace
-                        uploader = st.file_uploader(
-                            "Upload / replace image",
-                            type=["png","jpg","jpeg","webp","gif"],
-                            key=f"uploader_{tool_id}",
-                        )
-                        if uploader is not None:
-                            data = uploader.read()
-                            if len(data) > 5 * 1024 * 1024:  # 5 MB
-                                st.warning("This image is larger than 5 MB. Consider a smaller file for faster loading.")
-                            mime = uploader.type or "application/octet-stream"
-                            set_tool_image(tool_id, data, mime)
-                            st.success("Image saved.")
-                            st.rerun()
+                        # Image controls
+                        cimg1, cimg2 = st.columns([1,1])
+                        with cimg1:
+                            st.caption("Current image")
+                            if img_bytes:
+                                st.image(img_bytes, width=140)
+                            else:
+                                st.caption("— none —")
+                        with cimg2:
+                            st.caption("Upload new image")
+                            up = st.file_uploader("Choose image", type=["png","jpg","jpeg","webp"], key=f"up_{tool_id}")
+                            if up:
+                                new_bytes, new_mime = _read_upload(up)
+                            else:
+                                new_bytes, new_mime = (None, None)
 
                         cols_admin = st.columns([1,1,1])
                         if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
                             try:
                                 update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
+                                # set/replace image if a new one was uploaded
+                                if new_bytes:
+                                    update_tool_image(tool_id, new_bytes, new_mime)
                                 st.success("Updated.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Could not update: {e}")
+
+                        if cols_admin[1].button("Remove image", key=f"rmimg_{tool_id}"):
+                            update_tool_image(tool_id, None, None)
+                            st.info("Image removed.")
+                            st.rerun()
 
                         delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
                         if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
