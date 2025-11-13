@@ -475,82 +475,81 @@ else:
     if df.empty:
         st.info("No items found for this category.")
     else:
-        for _, row in df.iterrows():
+    # Tools exist for this category
+    for _, row in df.iterrows():   # <-- colon here
+        tool_id = int(row["id"])   # <-- 4 spaces in from the 'for' line
+        name = row["name"]
+        qty = int(row.get("quantity", 0) or 0)
+        current_out = int(row.get("current_out", 0) or 0)
+        available_qty = qty - current_out
+        holder = last_holder(tool_id)
 
-    tool_id = int(row["id"])
-    name = row["name"]
-    qty = int(row.get("quantity", 0) or 0)
-    current_out = int(row.get("current_out", 0) or 0)
-    available_qty = qty - current_out
-    holder = last_holder(tool_id)
-
-    status_html = ""
-    if available_qty > 0:
-        status_html = f"<span class='chip ok'>Available</span> ({available_qty})"
-    else:
-        if holder:
-            status_html = f"<span class='chip bad'>Unavailable</span> — held by **{holder}**"
+        status_html = ""
+        if available_qty > 0:
+            status_html = f"<span class='chip ok'>Available</span> ({available_qty})"
         else:
-            status_html = f"<span class='chip bad'>Unavailable</span>"
-
-    # ===== Card for this tool =====
-    with st.container(border=True):
-        # 4 columns: image | info | status | actions
-        c0, c1, c2, c3 = st.columns([1, 4, 2, 3])
-
-        # --- Image column ---
-        with c0:
-            # Show either stored bytes, or a URL, or a placeholder
-            img_shown = False
-            if "image_bytes" in row and row["image_bytes"] is not None:
-                try:
-                    st.image(row["image_bytes"], use_column_width=True)
-                    img_shown = True
-                except Exception:
-                    pass
-            if (not img_shown) and ("image_url" in row) and row["image_url"]:
-                try:
-                    st.image(row["image_url"], use_column_width=True)
-                    img_shown = True
-                except Exception:
-                    pass
-            if not img_shown:
-                st.caption("No image")
-
-        # --- Info column ---
-        with c1:
-            st.markdown(f"**{name}**")
-            st.caption(f"Total: {qty}  |  Out: {current_out}")
-
-        # --- Status column ---
-        with c2:
-            st.markdown(status_html, unsafe_allow_html=True)
-
-        # --- Actions column ---
-        with c3:
-            user = st.session_state["current_user"]
-            is_admin = st.session_state["is_admin"]
-
-            colb1, colb2 = st.columns(2)
-
-            # CHECK OUT
-            if available_qty > 0:
-                if colb1.button("Check Out", key=f"out_{tool_id}_{name}"):
-                    ok = record_checkout(tool_id, user)
-                    if not ok:
-                        st.warning("No available quantity.")
-                    st.rerun()
+            if holder:
+                status_html = f"<span class='chip bad'>Unavailable</span> — held by **{holder}**"
             else:
-                colb1.button("Check Out", key=f"out_{tool_id}_{name}", disabled=True)
+                status_html = f"<span class='chip bad'>Unavailable</span>"
 
-            # CHECK IN (only holder or admin)
-            can_checkin = (current_out > 0) and (is_admin or (holder == user))
-            if colb2.button("Check In", key=f"in_{tool_id}_{name}", disabled=not can_checkin):
-                if can_checkin:
-                    record_checkin(tool_id, user)
-                    st.rerun()
+        # ===== Card for this tool =====
+        with st.container(border=True):
+            # 4 columns: image | info | status | actions
+            c0, c1, c2, c3 = st.columns([1, 4, 2, 3])
+
+            # --- Image column ---
+            with c0:
+                img_shown = False
+                if "image_bytes" in row and row["image_bytes"] is not None:
+                    try:
+                        st.image(row["image_bytes"], use_column_width=True)
+                        img_shown = True
+                    except Exception:
+                        pass
+                if (not img_shown) and ("image_url" in row) and row["image_url"]:
+                    try:
+                        st.image(row["image_url"], use_column_width=True)
+                        img_shown = True
+                    except Exception:
+                        pass
+                if not img_shown:
+                    st.caption("No image")
+
+            # --- Info column ---
+            with c1:
+                st.markdown(f"**{name}**")
+                st.caption(f"Total: {qty}  |  Out: {current_out}")
+
+            # --- Status column ---
+            with c2:
+                st.markdown(status_html, unsafe_allow_html=True)
+
+            # --- Actions column ---
+            with c3:
+                user = st.session_state["current_user"]
+                is_admin = st.session_state["is_admin"]
+
+                colb1, colb2 = st.columns(2)
+
+                # CHECK OUT
+                if available_qty > 0:
+                    if colb1.button("Check Out", key=f"out_{tool_id}_{name}"):
+                        ok = record_checkout(tool_id, user)
+                        if not ok:
+                            st.warning("No available quantity.")
+                        st.rerun()
                 else:
-                    st.error("Only the current holder or admin can check this in.")
+                    colb1.button("Check Out", key=f"out_{tool_id}_{name}", disabled=True)
+
+                # CHECK IN (only holder or admin)
+                can_checkin = (current_out > 0) and (is_admin or (holder == user))
+                if colb2.button("Check In", key=f"in_{tool_id}_{name}", disabled=not can_checkin):
+                    if can_checkin:
+                        record_checkin(tool_id, user)
+                        st.rerun()
+                    else:
+                        st.error("Only the current holder or admin can check this in.")
 
     # ---------- Admin: Edit / Delete ----------
     if st.session_state["is_admin"]:
