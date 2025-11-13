@@ -476,6 +476,7 @@ else:
         st.info("No items found for this category.")
     else:
         for _, row in df.iterrows():
+
     tool_id = int(row["id"])
     name = row["name"]
     qty = int(row.get("quantity", 0) or 0)
