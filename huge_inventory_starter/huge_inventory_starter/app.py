@@ -1,12 +1,14 @@
 # Author: HUGE Handyman + ChatGPT
 # Streamlit + PostgreSQL (SQLAlchemy)
-# Inventory app with: safe images (upload or URL), category bar, text logs, roster, quick "My Tools"
+# Inventory app with: safe images (upload or URL) + auto compression, "My Tools",
+# admin edit/delete, activity log, single orange category bar
 
 import os
-from datetime import datetime
+import io
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
+from PIL import Image  # for compression
 
 # -----------------------------------------------------------------------------
 # Config & Theme
@@ -135,13 +137,26 @@ try:
     END $$;
     """)
 except Exception:
-    # SQLite fallback or permission restricted; ignore in local dev
+    # SQLite fallback or restricted env; ignore locally
     pass
+
+# -----------------------------------------------------------------------------
+# Image compression helper
+# -----------------------------------------------------------------------------
+def compress_upload(file_bytes: bytes, max_width: int = 1000, quality: int = 78):
+    """Resize wide images and save as WebP for small, fast loads."""
+    im = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    w, h = im.size
+    if w > max_width:
+        new_h = int(h * (max_width / w))
+        im = im.resize((max_width, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="WEBP", quality=quality, method=6)
+    return buf.getvalue(), "image/webp"
 
 # -----------------------------------------------------------------------------
 # Data helpers
 # -----------------------------------------------------------------------------
-# NOTE: Add/keep any new categories here (won't delete data if categories contain items)
 CATEGORIES = [
     "Power Tools",
     "Hand Tools",
@@ -152,7 +167,7 @@ CATEGORIES = [
     "Blankets & Drop Cloths",
     "Extra Material",         # text log
     "Bags / Accessories",     # text log
-    # new: add more if you want (data remains safe in DB)
+    # Add any new categories here (data stays safe)
 ]
 
 TEXT_LOGS = {
@@ -164,9 +179,8 @@ def upsert_tool(name: str, category: str, quantity: int,
                 image_url: str | None = None,
                 image_bytes: bytes | None = None,
                 image_mime: str | None = None):
-    # Only allow http(s) URLs; ignore file:/// to prevent crashes
+    # Only allow http(s) URLs; ignore file:// to prevent crashes
     safe_url = image_url if (image_url and image_url.lower().startswith(("http://", "https://"))) else None
-
     db_exec(
         """
         INSERT INTO tools(name, category, quantity, image_url, image_bytes, image_mime)
@@ -216,7 +230,7 @@ def last_holder(tool_id: int) -> str | None:
         select user_name, action
         from transactions
         where tool_id = :tid
-        order by ts desc
+        order by ts desc, id desc
         limit 1
         """,
         {"tid": tool_id},
@@ -235,19 +249,41 @@ def log_text(which: str, user_name: str, entry: str):
 def read_log(table: str, limit: int = 50) -> pd.DataFrame:
     return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
 
-# Roster
-def list_users() -> list[str]:
-    df = db_read_df("select name from users order by name")
-    return df["name"].tolist() if not df.empty else []
-
-def add_user(name: str, pin: str | None = None):
+# ---------- Admin helpers ----------
+def update_tool_fields(tool_id: int, name: str, category: str, quantity: int, image_url: str | None = None):
     db_exec(
-        "insert into users(name, pin) values (:n, :p) on conflict(name) do nothing",
-        {"n": name.strip(), "p": (pin or "").strip()},
+        """
+        update tools
+           set name = :n,
+               category = :c,
+               quantity = :q,
+               image_url = :img
+         where id = :tid
+        """,
+        {"n": name.strip(), "c": category, "q": int(quantity), "img": (image_url or "").strip(), "tid": tool_id},
     )
 
-def delete_user(name: str):
-    db_exec("delete from users where name = :n", {"n": name})
+def delete_tool(tool_id: int, delete_history: bool = False):
+    row = db_read_df("select current_out from tools where id = :tid", {"tid": tool_id})
+    if not row.empty and int(row.iloc[0]["current_out"] or 0) > 0:
+        raise Exception("Cannot delete while items are checked out.")
+    if delete_history:
+        db_exec("delete from transactions where tool_id = :tid", {"tid": tool_id})
+    db_exec("delete from tools where id = :tid", {"tid": tool_id})
+
+def read_transactions(limit: int = 100) -> pd.DataFrame:
+    sql = """
+        select t.ts,
+               t.user_name,
+               case t.action when 'check_out' then 'Checked Out'
+                             when 'check_in'  then 'Checked In' end as action,
+               coalesce(z.name, concat('Tool #', t.tool_id::text)) as tool_name
+          from transactions t
+     left join tools z on z.id = t.tool_id
+         order by t.ts desc, t.id desc
+         limit :lim
+    """
+    return db_read_df(sql, {"lim": limit})
 
 # -----------------------------------------------------------------------------
 # Session & Auth
@@ -270,8 +306,9 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 # Sidebar: choose user
 st.sidebar.header(APP_BRAND)
-roster = list_users()
-picked = st.sidebar.selectbox("Select your name", ["—"] + roster, index=0)
+roster = db_read_df("select name from users order by name")
+roster_list = roster["name"].tolist() if not roster.empty else []
+picked = st.sidebar.selectbox("Select your name", ["—"] + roster_list, index=0)
 typed_name = st.sidebar.text_input("Or type your name")
 
 if st.sidebar.button("Use Roster"):
@@ -295,16 +332,17 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
     st.caption("Add / remove names for the employee dropdown.")
     new_emp = st.text_input("Add employee name", key="add_emp_name")
     new_pin = st.text_input("Optional PIN", key="add_emp_pin")
-    cols = st.columns([1,1,1])
-    if cols[0].button("Add to roster"):
+    cols_r = st.columns([1,1,1])
+    if cols_r[0].button("Add to roster"):
         if new_emp.strip():
-            add_user(new_emp.strip(), new_pin.strip())
+            db_exec("insert into users(name, pin) values (:n, :p) on conflict(name) do nothing",
+                    {"n": new_emp.strip(), "p": new_pin.strip()})
             st.success(f"Added {new_emp}")
             st.rerun()
-    if roster:
-        rm_emp = st.selectbox("Delete employee", ["—"] + roster, key="rm_emp")
-        if cols[1].button("Delete selected") and rm_emp != "—":
-            delete_user(rm_emp)
+    if roster_list:
+        rm_emp = st.selectbox("Delete employee", ["—"] + roster_list, key="rm_emp")
+        if cols_r[1].button("Delete selected") and rm_emp != "—":
+            db_exec("delete from users where name = :n", {"n": rm_emp})
             st.warning(f"Deleted {rm_emp}")
             st.rerun()
 
@@ -313,6 +351,7 @@ with st.sidebar.expander("Admin — Manage Employees", expanded=False):
 # -----------------------------------------------------------------------------
 def set_category(cat_label: str):
     st.session_state["active_cat"] = cat_label
+    st.rerun()
 
 st.write(f"Logged in as: **{st.session_state.get('current_user', 'Guest')}**")
 
@@ -327,7 +366,8 @@ active_cat = st.session_state["active_cat"]
 st.subheader(active_cat)
 
 # -----------------------------------------------------------------------------
-# --- My Checked-Out Tools (robust) ---
+# “My Checked-Out Tools” (robust window-function query)
+# -----------------------------------------------------------------------------
 my_name = st.session_state.get("current_user", "Guest")
 if my_name and my_name != "Guest":
     my_df = db_read_df(
@@ -338,6 +378,7 @@ if my_name and my_name != "Guest":
                 tr.user_name,
                 tr.action,
                 tr.ts,
+                tr.id,
                 ROW_NUMBER() OVER (
                     PARTITION BY tr.tool_id
                     ORDER BY tr.ts DESC, tr.id DESC
@@ -345,12 +386,12 @@ if my_name and my_name != "Guest":
             FROM transactions tr
         )
         SELECT t.id, t.name, t.category
-        FROM tools t
-        JOIN last_tx lt
-          ON lt.tool_id = t.id AND lt.rn = 1
-        WHERE lt.action = 'check_out'
-          AND lt.user_name = :u
-        ORDER BY t.category, t.name
+          FROM tools t
+          JOIN last_tx lt
+            ON lt.tool_id = t.id AND lt.rn = 1
+         WHERE lt.action = 'check_out'
+           AND lt.user_name = :u
+         ORDER BY t.category, t.name
         """,
         {"u": my_name}
     )
@@ -370,7 +411,7 @@ if my_name and my_name != "Guest":
 st.divider()
 
 # -----------------------------------------------------------------------------
-# Helpers: safe image render
+# Helpers: safe image render (never crashes)
 # -----------------------------------------------------------------------------
 def render_tool_image(row, width: int = 90):
     try:
@@ -409,6 +450,7 @@ if active_cat in TEXT_LOGS:
 
 else:
     # Tools category
+    # Admin add/update (with auto compression or URL)
     if st.session_state["is_admin"]:
         st.markdown("**Admin — Add or Update**")
         with st.form("admin_add_update"):
@@ -419,14 +461,17 @@ else:
             uploaded = st.file_uploader("Upload a picture (JPG/PNG/WebP)", type=["jpg", "jpeg", "png", "webp"])
             img_url  = st.text_input("Or paste a public image URL (http/https only)")
 
-            MAX_MB = 1.5
             image_bytes = None
             image_mime  = None
             if uploaded:
-                if uploaded.size > MAX_MB * 1024 * 1024:
-                    st.warning(f"Image too large (> {MAX_MB} MB). Please upload a smaller image.")
-                else:
-                    image_bytes = uploaded.getvalue()
+                raw = uploaded.getvalue()
+                try:
+                    # Compress to WebP ~1000px wide
+                    image_bytes, image_mime = compress_upload(raw, max_width=1000, quality=78)
+                    st.image(image_bytes, width=120)  # preview compressed
+                except Exception:
+                    # Fallback to original if Pillow fails
+                    image_bytes = raw
                     image_mime  = uploaded.type or "application/octet-stream"
                     st.image(image_bytes, width=120)
 
@@ -500,19 +545,53 @@ else:
                         else:
                             st.error("Only the current holder or admin can check this in.")
 
-                    # Admin: remove image / adjust quantity
+                    # ---------- Admin: Edit / Delete ----------
                     if is_admin:
-                        with colb3.popover("Manage", use_container_width=True):
-                            new_q = st.number_input("Set quantity", min_value=0, value=qty, step=1, key=f"qty_{tool_id}")
-                            if st.button("Update quantity", key=f"setqty_{tool_id}"):
-                                db_exec("UPDATE tools SET quantity = :q WHERE id = :tid", {"q": int(new_q), "tid": tool_id})
-                                st.success("Quantity updated")
-                                st.rerun()
-                            st.divider()
-                            if st.button("Remove image", key=f"rmimg_{tool_id}"):
-                                db_exec("UPDATE tools SET image_bytes = NULL, image_mime = NULL, image_url = NULL WHERE id = :tid", {"tid": tool_id})
+                        with st.expander("Admin: edit / delete", expanded=False):
+                            new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
+                            new_qty2 = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
+                            new_cat  = st.selectbox(
+                                "Category",
+                                CATEGORIES,
+                                index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
+                                key=f"ct_{tool_id}",
+                            )
+                            new_img  = st.text_input("Image URL (optional http/https)", value=(row.get("image_url") or ""), key=f"img_{tool_id}")
+
+                            csa, csb, csc = st.columns([1,1,1])
+                            if csa.button("Save changes", key=f"save_{tool_id}"):
+                                try:
+                                    update_tool_fields(tool_id, new_name, new_cat, int(new_qty2), new_img.strip())
+                                    st.success("Updated.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Could not update: {e}")
+
+                            if csb.button("Remove image", key=f"rmimg_{tool_id}"):
+                                db_exec("UPDATE tools SET image_bytes=NULL, image_mime=NULL, image_url=NULL WHERE id=:tid", {"tid": tool_id})
                                 st.success("Image removed")
                                 st.rerun()
+
+                            delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
+                            if csc.button("Delete tool", key=f"del_{tool_id}"):
+                                try:
+                                    delete_tool(tool_id, delete_history=delete_history)
+                                    st.warning("Tool deleted.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+
+# -----------------------------------------------------------------------------
+# Admin — Activity Log (last 100)
+# -----------------------------------------------------------------------------
+if st.session_state.get("is_admin"):
+    with st.expander("Admin — Activity Log (last 100)", expanded=False):
+        tx = read_transactions(limit=100)
+        if tx.empty:
+            st.info("No transactions yet.")
+        else:
+            tx = tx.rename(columns={"ts":"Timestamp", "user_name":"User", "action":"Action", "tool_name":"Tool"})
+            st.dataframe(tx, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # Footer
