@@ -1,6 +1,7 @@
 # Author: HUGE Handyman + ChatGPT
 # Streamlit + PostgreSQL (SQLAlchemy)
-# Inventory app with single category bar, admin edit/delete, and activity log viewer
+# Inventory app with single category bar, admin edit/delete, activity log viewer
+# + tool images (upload/remove) stored in DB as bytes
 
 import os
 from datetime import datetime
@@ -103,6 +104,23 @@ def init_db():
         for stmt in schema_sql.strip().split(";\n\n"):
             conn.execute(text(stmt + ";"))
 
+        # ---- Image columns migration (safe no-op if already exist) ----
+        # Postgres supports "IF NOT EXISTS" for add column. SQLite doesn't until 3.35,
+        # so fall back to a try/except second form for SQLite.
+        try:
+            conn.execute(text("alter table tools add column if not exists image_bytes bytea;"))
+            conn.execute(text("alter table tools add column if not exists image_mime text;"))
+        except Exception:
+            # SQLite path (adds columns if they don't yet exist)
+            try:
+                conn.execute(text("alter table tools add column image_bytes blob;"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("alter table tools add column image_mime text;"))
+            except Exception:
+                pass
+
 init_db()
 
 def db_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
@@ -112,6 +130,19 @@ def db_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
 def db_exec(sql: str, params: dict | None = None):
     with engine.begin() as conn:
         conn.execute(text(sql), params or {})
+
+# ---- Image helpers -----------------------------------------------------------
+def set_tool_image(tool_id: int, image_bytes: bytes, mime: str):
+    db_exec(
+        "update tools set image_bytes = :b, image_mime = :m where id = :tid",
+        {"b": image_bytes, "m": mime, "tid": tool_id},
+    )
+
+def clear_tool_image(tool_id: int):
+    db_exec(
+        "update tools set image_bytes = NULL, image_mime = NULL where id = :tid",
+        {"tid": tool_id},
+    )
 
 # -----------------------------------------------------------------------------
 # Data helpers
@@ -126,8 +157,8 @@ CATEGORIES = [
     "Blankets & Drop Cloths",
     "Extra Material",
     "Bags / Accessories",
- "Vacuums / Fans",
- "Uncommon Tools",
+    "Vacuums / Fans",
+    "Uncommon Tools",
 ]
 
 TEXT_LOGS = {
@@ -333,7 +364,7 @@ st.subheader(active_cat)
 # --- “My Checked-Out Tools” (for the logged-in user) ---
 my_name = st.session_state.get("current_user", "Guest")
 if my_name and my_name != "Guest":
-    # Part A: robust query – latest transaction per tool
+    # Latest transaction per tool for this user (still out)
     my_df = db_read_df(
         """
         WITH last_tx AS (
@@ -360,7 +391,6 @@ if my_name and my_name != "Guest":
         {"u": my_name}
     )
 
-    # Part B: UI panel + one-click check-in
     with st.expander(f"Your current tools ({len(my_df)})", expanded=False):
         if my_df.empty:
             st.caption("You have no tools checked out.")
@@ -433,12 +463,26 @@ else:
                     status_html = f"<span class='chip bad'>Unavailable</span>"
 
             with st.container(border=True):
-                c1, c2, c3 = st.columns([4,2,3])
+                # --- Layout: small image | name | status | actions
+                c0, c1, c2, c3 = st.columns([1.4, 4, 2, 3])
+
+                # Image preview (if present)
+                img_bytes = row.get("image_bytes", None)
+                img_mime = row.get("image_mime", None)
+                with c0:
+                    if img_bytes:
+                        st.image(img_bytes, width=90, caption=None, use_column_width=False)
+
+                # Info
                 with c1:
                     st.markdown(f"**{name}**")
                     st.caption(f"Total: {qty}  |  Out: {current_out}")
+
+                # Status
                 with c2:
                     st.markdown(status_html, unsafe_allow_html=True)
+
+                # Actions
                 with c3:
                     user = st.session_state["current_user"]
                     is_admin = st.session_state["is_admin"]
@@ -464,17 +508,42 @@ else:
                         else:
                             st.error("Only the current holder or admin can check this in.")
 
-                # ---------- Admin: Edit / Delete ----------
+                # ---------- Admin: Edit / Delete + Image Upload ----------
                 if st.session_state["is_admin"]:
-                    with st.expander("Admin: edit / delete", expanded=False):
+                    with st.expander("Admin: edit / delete / image", expanded=False):
                         new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
-                        new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
-                        new_cat = st.selectbox(
+                        new_qty  = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
+                        new_cat  = st.selectbox(
                             "Category",
                             CATEGORIES,
                             index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
                             key=f"ct_{tool_id}",
                         )
+
+                        # --- Image upload / remove ---
+                        st.markdown("**Tool image**")
+                        if img_bytes:
+                            st.image(img_bytes, width=140)
+                            rem_col, up_col = st.columns([1,2])
+                            if rem_col.button("Remove image", key=f"rm_img_{tool_id}"):
+                                clear_tool_image(tool_id)
+                                st.success("Image removed.")
+                                st.rerun()
+                        # Upload new/replace
+                        uploader = st.file_uploader(
+                            "Upload / replace image",
+                            type=["png","jpg","jpeg","webp","gif"],
+                            key=f"uploader_{tool_id}",
+                        )
+                        if uploader is not None:
+                            data = uploader.read()
+                            if len(data) > 5 * 1024 * 1024:  # 5 MB
+                                st.warning("This image is larger than 5 MB. Consider a smaller file for faster loading.")
+                            mime = uploader.type or "application/octet-stream"
+                            set_tool_image(tool_id, data, mime)
+                            st.success("Image saved.")
+                            st.rerun()
+
                         cols_admin = st.columns([1,1,1])
                         if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
                             try:
