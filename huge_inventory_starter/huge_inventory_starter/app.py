@@ -1,12 +1,15 @@
 # Author: HUGE Handyman + ChatGPT
 # Streamlit + PostgreSQL (SQLAlchemy)
-# Inventory app with single category bar, admin edit/delete, image upload, and activity log viewer
+# Inventory app with single category bar, admin edit/delete, activity log,
+# "Your current tools", and per-item images with EXIF-aware normalization.
 
 import os
+import io
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
+from PIL import Image, ImageOps
 
 # -----------------------------------------------------------------------------
 # Config & Styling
@@ -61,6 +64,7 @@ st.markdown(
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///local.db")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
+
 def init_db():
     schema_sql = """
     create table if not exists tools (
@@ -68,7 +72,9 @@ def init_db():
         name text unique,
         category text,
         quantity int default 0,
-        current_out int default 0
+        current_out int default 0,
+        image_bytes bytea,
+        image_mime text
     );
 
     create table if not exists users (
@@ -98,46 +104,88 @@ def init_db():
         entry text,
         ts timestamptz default now()
     );
-
-    -- Add image columns if missing (Postgres supports IF NOT EXISTS)
-    alter table tools add column if not exists image_bytes bytea;
-    alter table tools add column if not exists image_mime  text;
     """
     with engine.begin() as conn:
         for stmt in schema_sql.strip().split(";\n\n"):
             if stmt.strip():
                 conn.execute(text(stmt + ";"))
 
+        # Add image columns if missing (for Postgres)
+        try:
+            conn.execute(text("alter table tools add column if not exists image_bytes bytea;"))
+        except Exception:
+            pass
+        try:
+            conn.execute(text("alter table tools add column if not exists image_mime text;"))
+        except Exception:
+            pass
+
+
 init_db()
+
 
 def db_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params)
 
+
 def db_exec(sql: str, params: dict | None = None):
     with engine.begin() as conn:
         conn.execute(text(sql), params or {})
 
-# --- image-byte helper (handles Postgres memoryview etc.) ---
-def _as_bytes(blob):
-    if blob is None:
-        return None
-    if isinstance(blob, (bytes, bytearray)):
-        return bytes(blob)
+# -----------------------------------------------------------------------------
+# Image helpers (EXIF-aware normalization)
+# -----------------------------------------------------------------------------
+def _normalize_image_bytes(data: bytes) -> tuple[bytes, str]:
+    """
+    Return (upright_bytes, mime). Uses EXIF orientation to rotate pixels.
+    Converts to JPEG (or PNG if transparency) and lightly compresses.
+    """
     try:
-        return bytes(blob)  # memoryview and other buffer-protocol types
-    except Exception:
-        return None
+        im = Image.open(io.BytesIO(data))
+        # Fix orientation
+        im = ImageOps.exif_transpose(im)
 
-# small helper for upload
+        # Choose format/mime
+        if im.mode in ("RGBA", "LA"):
+            fmt = "PNG"
+            mime = "image/png"
+        else:
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            fmt = "JPEG"
+            mime = "image/jpeg"
+
+        out = io.BytesIO()
+        if fmt == "JPEG":
+            im.save(out, format=fmt, quality=85, optimize=True)
+        else:
+            im.save(out, format=fmt, optimize=True)
+        return out.getvalue(), mime
+    except Exception:
+        return data, "application/octet-stream"
+
+
+def _upright_for_display(b: bytes) -> bytes:
+    """Do not change DB; just ensure preview is upright."""
+    try:
+        im = Image.open(io.BytesIO(b))
+        im = ImageOps.exif_transpose(im)
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return b
+
+
 def _read_upload(uploaded_file):
-    """Return (bytes, mime) or (None, None)."""
+    """Return (bytes, mime) or (None, None). Normalizes EXIF orientation."""
     if not uploaded_file:
         return None, None
     data = uploaded_file.read()
     if not data:
         return None, None
-    return data, uploaded_file.type or "application/octet-stream"
+    return _normalize_image_bytes(data)
 
 # -----------------------------------------------------------------------------
 # Data helpers
@@ -161,6 +209,7 @@ TEXT_LOGS = {
     "Bags / Accessories": "bags_accessories_log",
 }
 
+
 def upsert_tool(name: str, category: str, quantity: int):
     db_exec(
         """
@@ -173,8 +222,8 @@ def upsert_tool(name: str, category: str, quantity: int):
         {"n": name.strip(), "c": category, "q": int(quantity)},
     )
 
+
 def update_tool_fields(tool_id: int, name: str, category: str, quantity: int):
-    """Update name, category, and quantity for a given tool."""
     db_exec(
         """
         update tools
@@ -186,30 +235,48 @@ def update_tool_fields(tool_id: int, name: str, category: str, quantity: int):
         {"n": name.strip(), "c": category, "q": int(quantity), "tid": tool_id},
     )
 
-def update_tool_image(tool_id: int, img_bytes: bytes | None, img_mime: str | None):
-    """Set or clear image for a tool (pass None to clear)."""
-    if img_bytes is None:
-        db_exec(
-            "update tools set image_bytes = NULL, image_mime = NULL where id = :tid",
-            {"tid": tool_id},
-        )
-    else:
-        db_exec(
-            "update tools set image_bytes = :b, image_mime = :m where id = :tid",
-            {"b": img_bytes, "m": img_mime, "tid": tool_id},
-        )
 
 def delete_tool(tool_id: int, delete_history: bool = False):
-    """Delete a tool. If delete_history=True, also remove its transactions."""
     if delete_history:
         db_exec("delete from transactions where tool_id = :tid", {"tid": tool_id})
     db_exec("delete from tools where id = :tid", {"tid": tool_id})
 
+
+def update_tool_image(tool_id: int, b: bytes, mime: str):
+    db_exec(
+        "update tools set image_bytes = :b, image_mime = :m where id = :tid",
+        {"b": b, "m": mime, "tid": tool_id},
+    )
+
+
+def remove_tool_image(tool_id: int):
+    db_exec(
+        "update tools set image_bytes = null, image_mime = null where id = :tid",
+        {"tid": tool_id},
+    )
+
+
 def list_tools_by_category(cat: str) -> pd.DataFrame:
-    df = db_read_df("select * from tools where category = :c order by name", {"c": cat})
+    df = db_read_df(
+        "select id, name, category, quantity, current_out from tools where category = :c order by name",
+        {"c": cat},
+    )
     if not df.empty:
-        df["available_qty"] = (df["quantity"].fillna(0).astype(int) - df["current_out"].fillna(0).astype(int)).clip(lower=0)
+        df["available_qty"] = (
+            df["quantity"].fillna(0).astype(int) - df["current_out"].fillna(0).astype(int)
+        ).clip(lower=0)
     return df
+
+
+def get_tool_image(tool_id: int) -> tuple[bytes | None, str | None]:
+    df = db_read_df(
+        "select image_bytes, image_mime from tools where id = :tid",
+        {"tid": tool_id},
+    )
+    if df.empty:
+        return None, None
+    return df.iloc[0]["image_bytes"], df.iloc[0]["image_mime"]
+
 
 def record_checkout(tool_id: int, user_name: str) -> bool:
     df = db_read_df("select quantity, current_out from tools where id = :tid", {"tid": tool_id})
@@ -225,6 +292,7 @@ def record_checkout(tool_id: int, user_name: str) -> bool:
     )
     return True
 
+
 def record_checkin(tool_id: int, user_name: str) -> bool:
     db_exec("update tools set current_out = greatest(current_out - 1, 0) where id = :tid", {"tid": tool_id})
     db_exec(
@@ -232,6 +300,7 @@ def record_checkin(tool_id: int, user_name: str) -> bool:
         {"tid": tool_id, "u": user_name},
     )
     return True
+
 
 def last_holder(tool_id: int) -> str | None:
     df = db_read_df(
@@ -248,6 +317,7 @@ def last_holder(tool_id: int) -> str | None:
         return df.iloc[0]["user_name"]
     return None
 
+
 def log_text(which: str, user_name: str, entry: str):
     table = "extra_material_log" if which == "extra" else "bags_accessories_log"
     db_exec(
@@ -255,8 +325,10 @@ def log_text(which: str, user_name: str, entry: str):
         {"u": user_name, "e": entry.strip()},
     )
 
+
 def read_log(table: str, limit: int = 50) -> pd.DataFrame:
     return db_read_df(f"select user_name, entry, ts from {table} order by ts desc limit {limit}")
+
 
 def read_transactions(limit: int = 100) -> pd.DataFrame:
     sql = """
@@ -277,11 +349,13 @@ def list_users() -> list[str]:
     df = db_read_df("select name from users order by name")
     return df["name"].tolist() if not df.empty else []
 
+
 def add_user(name: str, pin: str | None = None):
     db_exec(
         "insert into users(name, pin) values (:n, :p) on conflict(name) do nothing",
         {"n": name.strip(), "p": (pin or "").strip()},
     )
+
 
 def delete_user(name: str):
     db_exec("delete from users where name = :n", {"n": name})
@@ -359,7 +433,7 @@ for i, label in enumerate(CATEGORIES):
     with cols[i]:
         if st.button(label, key=f"catbtn_{i}"):
             st.session_state["active_cat"] = label
-            st.rerun()   # Immediate UI update (prevents double-click)
+            st.rerun()
 st.markdown("</div>", unsafe_allow_html=True)
 
 active_cat = st.session_state["active_cat"]
@@ -410,7 +484,6 @@ if my_name and my_name != "Guest":
 # Content for the selected category
 # -----------------------------------------------------------------------------
 if active_cat in TEXT_LOGS:
-    # Text-entry categories
     table = TEXT_LOGS[active_cat]
     with st.form(f"log_form_{table}"):
         entry = st.text_input("Describe what you’re taking:", placeholder="e.g., 1 Milwaukee bag with 2 fine tool blades")
@@ -449,17 +522,14 @@ else:
         st.info("No items found for this category.")
     else:
         for _, row in df.iterrows():
-            tool_id     = int(row["id"])
-            name        = row["name"]
-            qty         = int(row.get("quantity", 0) or 0)
+            tool_id = int(row["id"])
+            name = row["name"]
+            qty = int(row.get("quantity", 0) or 0)
             current_out = int(row.get("current_out", 0) or 0)
             available_qty = qty - current_out
-            holder      = last_holder(tool_id)
+            holder = last_holder(tool_id)
 
-            # --- safe image bytes (handles Postgres memoryview) ---
-            raw_blob   = row.get("image_bytes", None)
-            img_bytes  = _as_bytes(raw_blob)      # <— critical fix
-            img_mime   = row.get("image_mime", None)
+            img_bytes, img_mime = get_tool_image(tool_id)
 
             status_html = ""
             if available_qty > 0:
@@ -470,13 +540,14 @@ else:
                 else:
                     status_html = f"<span class='chip bad'>Unavailable</span>"
 
+            # Card
             with st.container(border=True):
+                # Add a small image column on the left
                 c0, c1, c2, c3 = st.columns([1,4,2,3])
 
-                # small thumbnail
                 with c0:
                     if img_bytes:
-                        st.image(img_bytes, width=90, use_column_width=False)
+                        st.image(_upright_for_display(img_bytes), width=90, use_column_width=False)
 
                 with c1:
                     st.markdown(f"**{name}**")
@@ -510,53 +581,60 @@ else:
                         else:
                             st.error("Only the current holder or admin can check this in.")
 
-                # ---------- Admin: Edit / Delete (+ image upload/remove) ----------
+                # ---------- Admin: Edit / Delete ----------
                 if st.session_state["is_admin"]:
                     with st.expander("Admin: edit / delete", expanded=False):
                         new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
-                        new_qty  = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
-                        new_cat  = st.selectbox(
+                        new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
+                        new_cat = st.selectbox(
                             "Category",
                             CATEGORIES,
                             index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
                             key=f"ct_{tool_id}",
                         )
 
-                        # Image controls
-                        cimg1, cimg2 = st.columns([1,1])
-                        with cimg1:
-                            st.caption("Current image")
-                            if img_bytes:
-                                st.image(img_bytes, width=140)
-                            else:
-                                st.caption("— none —")
-                        with cimg2:
-                            st.caption("Upload new image")
-                            up = st.file_uploader("Choose image", type=["png","jpg","jpeg","webp"], key=f"up_{tool_id}")
-                            if up:
-                                new_bytes, new_mime = _read_upload(up)
-                            else:
-                                new_bytes, new_mime = (None, None)
+                        st.caption("Current image")
+                        if img_bytes:
+                            st.image(_upright_for_display(img_bytes), width=140)
+                        else:
+                            st.caption("— none —")
 
-                        cols_admin = st.columns([1,1,1])
+                        up = st.file_uploader(
+                            "Choose image", type=["png", "jpg", "jpeg", "webp"], key=f"fu_{tool_id}"
+                        )
+
+                        cols_admin = st.columns([1,1,1,1])
                         if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
                             try:
                                 update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
-                                # set/replace image if a new one was uploaded
-                                if new_bytes:
-                                    update_tool_image(tool_id, new_bytes, new_mime)
                                 st.success("Updated.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Could not update: {e}")
 
-                        if cols_admin[1].button("Remove image", key=f"rmimg_{tool_id}"):
-                            update_tool_image(tool_id, None, None)
-                            st.info("Image removed.")
+                        if cols_admin[1].button("Upload new image", key=f"upimg_{tool_id}"):
+                            b, mime = _read_upload(up)
+                            if b:
+                                update_tool_image(tool_id, b, mime)
+                                st.success("Image saved.")
+                                st.rerun()
+                            else:
+                                st.warning("No file selected.")
+
+                        if img_bytes and cols_admin[2].button("Remove image", key=f"rmimg_{tool_id}"):
+                            remove_tool_image(tool_id)
+                            st.success("Image removed.")
+                            st.rerun()
+
+                        # One-click fixer for already stored sideways images
+                        if img_bytes and cols_admin[3].button("Fix orientation", key=f"fiximg_{tool_id}"):
+                            fixed_bytes, fixed_mime = _normalize_image_bytes(img_bytes)
+                            update_tool_image(tool_id, fixed_bytes, fixed_mime)
+                            st.success("Image orientation fixed.")
                             st.rerun()
 
                         delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
-                        if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
+                        if st.button("Delete tool", key=f"del_{tool_id}"):
                             try:
                                 delete_tool(tool_id, delete_history=delete_history)
                                 st.warning("Tool deleted.")
