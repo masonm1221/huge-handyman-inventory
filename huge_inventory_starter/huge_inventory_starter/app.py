@@ -103,7 +103,51 @@ def init_db():
         for stmt in schema_sql.strip().split(";\n\n"):
             conn.execute(text(stmt + ";"))
 
+# --- ensure image columns exist on tools (safe, idempotent) ---
+def ensure_image_columns():
+    # Render Postgres: robust migration
+    if "postgres" in os.environ.get("DATABASE_URL", "").lower():
+        try:
+            db_exec("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='tools' AND column_name='image_bytes'
+                ) THEN
+                    ALTER TABLE tools ADD COLUMN image_bytes BYTEA;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='tools' AND column_name='image_mime'
+                ) THEN
+                    ALTER TABLE tools ADD COLUMN image_mime TEXT;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='tools' AND column_name='image_url'
+                ) THEN
+                    ALTER TABLE tools ADD COLUMN image_url TEXT;
+                END IF;
+            END $$;
+            """)
+        except Exception:
+            pass   # don’t crash if migration can’t run
+    else:
+        # Local SQLite dev: try simple ADD COLUMNs
+        for sql in [
+            "ALTER TABLE tools ADD COLUMN image_bytes BLOB;",
+            "ALTER TABLE tools ADD COLUMN image_mime TEXT;",
+            "ALTER TABLE tools ADD COLUMN image_url TEXT;",
+        ]:
+            try:
+                db_exec(sql)
+            except Exception:
+                pass
+
+# Call init, then ensure the columns (run once at startup)
 init_db()
+ensure_image_columns()
 
 def db_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
     with engine.connect() as conn:
@@ -116,6 +160,22 @@ def db_exec(sql: str, params: dict | None = None):
 # -----------------------------------------------------------------------------
 # Data helpers
 # -----------------------------------------------------------------------------
+def render_tool_image(row, width: int = 80):
+    """Show a thumbnail if present; never crash the page."""
+    try:
+        img_bytes = row.get("image_bytes")
+        img_url   = (row.get("image_url") or "").strip() if "image_url" in row else ""
+
+        if img_bytes is not None and (len(img_bytes) if hasattr(img_bytes, "__len__") else 0) > 0:
+            st.image(img_bytes, width=width)
+            return
+        if img_url and img_url.lower().startswith(("http://", "https://")):
+            st.image(img_url, width=width)
+            return
+        st.caption("No image")
+    except Exception:
+        st.caption("Image unavailable")
+
 CATEGORIES = [
     "Power Tools",
     "Hand Tools",
@@ -433,17 +493,90 @@ else:
                     status_html = f"<span class='chip bad'>Unavailable</span>"
 
             with st.container(border=True):
-                c1, c2, c3 = st.columns([4,2,3])
-                with c1:
-                    st.markdown(f"**{name}**")
-                    st.caption(f"Total: {qty}  |  Out: {current_out}")
-                with c2:
-                    st.markdown(status_html, unsafe_allow_html=True)
-                with c3:
-                    user = st.session_state["current_user"]
-                    is_admin = st.session_state["is_admin"]
+    # Make room for a thumbnail on the left
+    c0, c1, c2, c3 = st.columns([1,4,2,3])
 
-                    colb1, colb2 = st.columns(2)
+    # NEW: thumbnail first
+    with c0:
+        render_tool_image(row)
+
+    # Move name/qty here (was c1 previously)
+    with c1:
+        st.markdown(f"**{name}**")
+        st.caption(f"Total: {qty}  |  Out: {current_out}")
+
+    # Status chip here (was c2 previously)
+    with c2:
+        st.markdown(status_html, unsafe_allow_html=True)
+
+    # Buttons and admin controls here (was c3 previously)
+    with c3:
+        user = st.session_state["current_user"]
+        is_admin = st.session_state["is_admin"]
+
+        colb1, colb2 = st.columns(2)
+
+        # CHECK OUT
+        if available_qty > 0:
+            if colb1.button("Check Out", key=f"out_{tool_id}_{name}"):
+                ok = record_checkout(tool_id, user)
+                if not ok:
+                    st.warning("No available quantity.")
+                st.rerun()
+        else:
+            colb1.button("Check Out", key=f"out_{tool_id}_{name}", disabled=True)
+
+        # CHECK IN (only holder or admin)
+        can_checkin = (current_out > 0) and (is_admin or (holder == user))
+        if colb2.button("Check In", key=f"in_{tool_id}_{name}", disabled=not can_checkin):
+            if can_checkin:
+                record_checkin(tool_id, user)
+                st.rerun()
+            else:
+                st.error("Only the current holder or admin can check this in.")
+
+    # ---------- Admin: Edit / Delete ----------
+    if st.session_state["is_admin"]:
+        with st.expander("Admin: edit / delete", expanded=False):
+            new_name = st.text_input("Name", value=name, key=f"nm_{tool_id}")
+            new_qty = st.number_input("Quantity", value=qty, min_value=0, step=1, key=f"qt_{tool_id}")
+            new_cat = st.selectbox(
+                "Category",
+                CATEGORIES,
+                index=CATEGORIES.index(active_cat) if active_cat in CATEGORIES else 0,
+                key=f"ct_{tool_id}",
+            )
+
+            # --- Image upload (replace or add) ---
+            st.markdown("—")
+            st.caption("Image (upload to replace)")
+            up = st.file_uploader("Upload JPG/PNG/WebP", type=["jpg","jpeg","png","webp"], key=f"upload_{tool_id}")
+            if up and st.button("Save image", key=f"saveimg_{tool_id}"):
+                raw = up.getvalue()
+                db_exec(
+                    "UPDATE tools SET image_bytes = :b, image_mime = :m, image_url = NULL WHERE id = :tid",
+                    {"b": raw, "m": (up.type or "application/octet-stream"), "tid": tool_id}
+                )
+                st.success("Image saved.")
+                st.rerun()
+
+            cols_admin = st.columns([1,1,1])
+            if cols_admin[0].button("Save changes", key=f"save_{tool_id}"):
+                try:
+                    update_tool_fields(tool_id, new_name, new_cat, int(new_qty))
+                    st.success("Updated.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not update: {e}")
+
+            delete_history = st.checkbox("Also delete history", value=False, key=f"dh_{tool_id}")
+            if cols_admin[2].button("Delete tool", key=f"del_{tool_id}"):
+                try:
+                    delete_tool(tool_id, delete_history=delete_history)
+                    st.warning("Tool deleted.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not delete: {e}")
 
                     # CHECK OUT
                     if available_qty > 0:
